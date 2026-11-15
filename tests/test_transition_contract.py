@@ -1,0 +1,94 @@
+import copy
+import unittest
+
+from evidence_writer import text_audit_prompt
+from grounded_pipeline import audit_narrations
+from transition_contract import apply_transition_contracts
+
+
+class TransitionContractTests(unittest.TestCase):
+    def event(self, event_id, **updates):
+        row = dict(event_id=event_id, event='Một sự kiện được quan sát.',
+                   sentence_slots=[{'unit_id': event_id + '_U001'}],
+                   scene_context={})
+        row.update(updates)
+        return row
+
+    def contracts(self, first, second):
+        plan = apply_transition_contracts({'events_by_part': [[first, second]]})
+        return plan['events_by_part'][0]
+
+    def test_same_situation_is_a_continuation_without_forced_connector(self):
+        _, current = self.contracts(
+            self.event('E1', situation_id='SAME', characters=['P1']),
+            self.event('E2', situation_id='SAME', characters=['P1']))
+        contract = current['transition_contract']
+        self.assertEqual(contract['relation'], 'continuation')
+        self.assertFalse(contract['requires_bridge'])
+        self.assertIn('transition_contract', current['sentence_slots'][0])
+
+    def test_confirmed_location_change_requires_a_semantic_bridge(self):
+        _, current = self.contracts(
+            self.event('E1', scene_context={'location': 'nhà bếp'}),
+            self.event('E2', temporal_relation='continuation',
+                       scene_context={'location': 'sân trường'}))
+        contract = current['transition_contract']
+        self.assertEqual(contract['relation'], 'location_change')
+        self.assertTrue(contract['requires_bridge'])
+        self.assertEqual(contract['previous_location'], 'nhà bếp')
+        self.assertEqual(contract['current_location'], 'sân trường')
+
+    def test_unknown_relationship_uses_neutral_reintroduction(self):
+        _, current = self.contracts(
+            self.event('E1', characters=['P1']),
+            self.event('E2', characters=['P2']))
+        contract = current['transition_contract']
+        self.assertEqual(contract['relation'], 'neutral_reintroduction')
+        self.assertEqual(contract['wording_policy'], 'neutral_current_anchor_only')
+
+    def test_explicit_dependency_allows_consequence_not_a_phrase_template(self):
+        _, current = self.contracts(
+            self.event('E1', outcome='Trận chiến kết thúc.'),
+            self.event('E2', depends_on=['E1'], event='Cả nhóm rời đi.'))
+        contract = current['transition_contract']
+        self.assertEqual(contract['relation'], 'consequence')
+        self.assertIn('explicit_event_dependency', contract['evidence_basis'])
+        prompt = text_audit_prompt([{'scene_id': 'S2', 'tts': 'Sau trận chiến, cả nhóm rời đi.',
+                                     'observed_facts': [], 'transition_contract': contract}])
+        self.assertIn('Y NGHIA', prompt)
+        self.assertIn('khong chep dung mot cum tu mau', prompt)
+
+    def test_verified_bridge_can_request_varied_preparation_wording(self):
+        _, current = self.contracts(
+            self.event('E1', outcome='Cả nhóm xác định nơi kẻ địch ẩn náu.'),
+            self.event('E2', bridge_from_previous={
+                'relation': 'preparation', 'facts': ['Doraemon lấy bảo bối.']
+            }, event='Cả nhóm chuẩn bị bảo bối.'))
+        contract = current['transition_contract']
+        self.assertEqual(contract['relation'], 'preparation')
+        self.assertEqual(contract['wording_policy'], 'free_semantic_paraphrase')
+        self.assertIn('verified_bridge_from_previous', contract['evidence_basis'])
+        self.assertIn('semantic_goal', contract)
+
+    def test_contract_is_part_of_audit_card_and_cache_signature(self):
+        scene = dict(scene_id='S1', tts='Nhân vật bước sang căn phòng khác.',
+                     observed_facts=[{'text': 'Nhân vật bước đi.'}],
+                     grounded_plan_locked=True,
+                     transition_contract={'relation': 'location_change'})
+        payload = {'parts': [{'scenes': [scene]}]}
+        cards_seen, cache = [], {}
+
+        def audit(cards):
+            cards_seen.append(copy.deepcopy(cards))
+            return {'checks': [{'scene_id': 'S1', 'faithful': True, 'reason': ''}]}
+
+        audit_narrations(payload, audit, checkpoint=cache, save=lambda value: (cache.clear(), cache.update(value)))
+        self.assertEqual(cards_seen[0][0]['transition_contract']['relation'], 'location_change')
+        changed = copy.deepcopy(payload)
+        changed['parts'][0]['scenes'][0]['transition_contract']['relation'] = 'time_jump'
+        audit_narrations(changed, audit, checkpoint=cache)
+        self.assertEqual(len(cards_seen), 2)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,0 +1,10 @@
+Flask
+google-genai
+edge-tts
+imageio-ffmpeg
+Pillow
+requests
+
+# Optional local fallback when Groq is unavailable:
+# faster-whisper
+
