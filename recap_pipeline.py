@@ -81,11 +81,8 @@ VIETNAMESE_FUNCTION_WORDS = {
 
 
 def character_name_in_text(name, text):
-    for match in re.finditer(rf'(?<!\w){re.escape(name)}(?!\w)', str(text), re.I):
-        if str(name).casefold() == 'gian' and re.search(r'(?:thời|không)\s+$', str(text)[:match.start()], re.I):
-            continue
-        return True
-    return False
+    from identity_contract import name_in_text
+    return name_in_text(name, text)
 
 
 def vietnamese_narration_issues(value):
@@ -3032,6 +3029,8 @@ def apply_verified_evidence_results(chunk_evidence, audit, verification_texts=No
                 if fact.get('identity_tokens_rendered'):
                     fact['text'] = render_ids(fact['raw_text'], token_labels, allow_bare=False)
                     fact['canonical_actor_ids'] = [token_ids[i.upper()] for i in fact.get('actor_ids') or [] if i.upper() in token_ids]
+                    fact['identity_bindings'] = {i.upper(): token_ids.get(i.upper())
+                                                 for i in fact.get('actor_ids') or []}
                 else:
                     fact['text'] = safe_name_mentions(fact.get('text', ''), prose_replacements)
             repair = repairs.get(str(event.get("evidence_id", "")).upper())
@@ -5645,6 +5644,12 @@ def build_part_story_context(story_plan, part_number, previous_response=None):
         local_event['visible_character_names'] = sorted({name for cid in event.get('characters') or []
             for name in character_names_by_id.get(cid, [])})
         local_event['mentioned_character_names'] = sorted(explicit_names)
+        from identity_contract import scene_identity_contract
+        local_event['identity_contract'] = scene_identity_contract(event, story_plan.get('characters') or [])
+        local_event['visible_character_names'] = local_event['identity_contract']['visible_names']
+        local_event['mentioned_character_names'] = local_event['identity_contract']['mentioned_names']
+        local_event['allowed_character_names'] = sorted(set(
+            local_event['visible_character_names'] + local_event['mentioned_character_names']))
         position = global_position.get(
             str(event.get("event_id", "")).strip().upper()
         )
@@ -6156,6 +6161,7 @@ def coerce_single_part_response(
                 "repeat_group", "fact_id", "forbidden_previous_facts",
                 "supporting_facts", "visual_sources", "covered_events",
                 "allowed_character_names", "merged_evidence_ids",
+                "identity_contract",
                 "previous_event_context", "next_event_context",
                 "source", "source_confidence", "spoken_text", "transcript_evidence",
                 "estimated_tts_seconds", "available_visual_seconds",
@@ -6662,43 +6668,12 @@ def single_part_missing_requirements(
                 else:
                     existing["repeated_previous"] = True
             previous_tokens = narration_tokens
-    registered_character_names = []
-    for character in payload.get("characters") or []:
-        if not isinstance(character, dict):
-            continue
-        aliases = character.get("aliases") or []
-        if not isinstance(aliases, list):
-            aliases = [aliases]
-        for value in [character.get("name"), *aliases]:
-            name = re.sub(r"\s+", " ", str(value or "")).strip()
-            if name and name.casefold() not in {
-                known.casefold() for known in registered_character_names
-            }:
-                registered_character_names.append(name)
+    from identity_contract import character_issues
     invalid_character_mentions = []
     for index, scene in enumerate(scenes, start=1):
-        allowed = scene.get("allowed_character_names") or []
-        if not isinstance(allowed, list):
-            allowed = [allowed]
-        allowed_keys = {
-            re.sub(r"\s+", " ", str(value or "")).strip().casefold()
-            for value in allowed if str(value or "").strip()
-        }
-        if not allowed_keys:
-            continue
-        narration = str(scene.get("tts", ""))
-        unexpected = []
-        for name in registered_character_names:
-            if name.casefold() in allowed_keys:
-                continue
-            if character_name_in_text(name, narration):
-                unexpected.append(name)
-        if unexpected:
-            invalid_character_mentions.append({
-                "scene_id": str(scene.get("scene_id") or f"SCENE_{index}"),
-                "unexpected_names": unexpected,
-                "allowed_names": sorted(allowed_keys),
-            })
+        invalid_character_mentions.extend(character_issues(
+            dict(scene, scene_id=str(scene.get('scene_id') or f'SCENE_{index}')),
+            payload.get('characters') or []))
     invalid_narrative_links = []
     if require_narrative_links:
         for index, scene in enumerate(scenes):
@@ -7862,6 +7837,9 @@ def build_targeted_narration_repair_prompt(
             reasons.setdefault(scene_id, []).append({
                 "unexpected_names": list(item.get("unexpected_names") or []),
                 "allowed_names": list(item.get("allowed_names") or []),
+                "visible_names": list(item.get("visible_names") or []),
+                "mentioned_names": list(item.get("mentioned_names") or []),
+                "identity_evidence": copy.deepcopy(item.get("identity_evidence") or []),
             })
 
     requested_event_ids = []
@@ -7894,6 +7872,7 @@ def build_targeted_narration_repair_prompt(
             "allowed_character_names": list(
                 event.get("allowed_character_names") or []
             ),
+            "identity_contract": copy.deepcopy(event.get('identity_contract') or {}),
             "minimum_words": int(event.get("tts_min_words", MIN_TTS_WORDS)),
             "maximum_words": int(event.get("tts_max_words", MAX_TTS_WORDS)),
             "reason": reasons.get(scene_id, [{"missing_sentence": True}]),
@@ -7920,7 +7899,13 @@ def build_targeted_narration_repair_prompt(
 - Khi sua unsupported_narration, bo dung chi tiet bi bac bo; giu hanh dong da duoc
   observed_facts chung minh. Khong them tinh tu cam giac (mat lanh), pham chat
   (dung cam), thai do (quyet doan) neu facts khong neu. Khong them y de du so tu.
+- Voi vat the, sinh vat hoac quai vat co ten cu the trong observed_facts (vi du
+  Giga Zombie), phai dung dung ten do; khong doi thanh cach goi khai quat nhu
+  "con thu", "ke la" hay "sinh vat" neu fact da xac dinh ro.
 - Chi goi ten trong allowed_character_names. Neu chua chac ten, dung vai tro trung tinh.
+- identity_contract phan biet nguoi co mat va nguoi chi duoc nhac: ten chi duoc nhac khong
+  chung minh nguoi do dang thuc hien hanh dong trong hinh. Chi sua ten/menh de bi chi ra;
+  giu nguyen cau da dat. Khong tu tao ten rieng, quan he gia dinh hay loai sinh vat.
 - Khong viet timestamp, ghi chu, ma scene hay loi giai thich trong TTS.
 
 CAC CAU CAN VIET LAI:
@@ -7931,7 +7916,7 @@ Chi tra JSON: {{"scenes":[{{"scene_id":"S0001","event_id":"EV001","tts":"...","v
 
 
 def apply_targeted_narration_repairs(
-    payload, text, requested_event_ids, locked_event_by_id,
+    payload, text, requested_event_ids, locked_event_by_id, *, allow_partial=False,
 ):
     """Merge exact repaired rows; missing scenes are restored from locked events."""
     source = copy.deepcopy(
@@ -7981,7 +7966,7 @@ def apply_targeted_narration_repairs(
                           'narration_unit_version', 'transition_contract', 'transition_contract_version'):
                 if field in row:
                     replacements[event_id][field] = copy.deepcopy(row[field])
-    if set(replacements) != expected:
+    if set(replacements) - expected or (not allow_partial and set(replacements) != expected):
         raise ValueError(
             "TARGETED_REPAIR_IDS_INVALID: thieu "
             + ",".join(sorted(expected - set(replacements)))

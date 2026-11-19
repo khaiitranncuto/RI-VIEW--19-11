@@ -11,9 +11,22 @@ from source_grounded_writer import bind_written_scenes, signature
 VERSION = 1
 
 VIETNAMESE_WRITER_RULE = (
+    'QUY TAC LOI KE BAT BUOC (RECAP_DIRECT_DIALOGUE): Whisper/spoken_text chi la bang chung, '
+    'khong phai loi doc. Chuyen noi dung thoai thanh loi ke gian tiep ngoi thu ba. '
+    'Vi du: Anh ta noi: "Toi se quay lai" -> Anh ta cho biet minh se quay lai. '
+    'Khong dong vai nhan vat, khong chep cau thoai, khong dung dau nhay hay gach dau dong '
+    'trong text/paragraph/tts/narration_units. Khong chi xoa dau nhay: phai viet lai '
+    'dai tu va cach dien dat thanh loi nguoi ke, giu dung y va bang chung. '
+    'Khong tu gan nguoi noi neu nguon chua xac nhan. Tu kiem tra tung cau truoc khi tra JSON.\n'
     'NGÔN NGỮ BẮT BUỘC: Toàn bộ lời recap trong text, paragraph hoặc tts '
-    'phải bằng tiếng Việt có dấu. Chỉ giữ nguyên tên riêng nhân vật, địa danh '
-    'và đồ vật; không đổi tên riêng đã xác nhận. Dù dữ kiện nguồn, ngữ cảnh '
+    'phải bằng tiếng Việt có dấu. CHỈ tên người/nhân vật được giữ nguyên tiếng Anh. '
+    'Tên bảo bối, đồ vật, địa danh, tổ chức và mọi phần lời kể phải bằng tiếng Việt. '
+    'Tên tiếng Anh trong fact/spoken_text không phải ngoại lệ. Dùng tên tiếng Việt '
+    'đã được nguồn xác nhận; nếu chưa có, dùng mô tả chức năng/đặc điểm tiếng Việt '
+    'đúng bằng chứng, không bịa tên hoặc công dụng. Ví dụ Rescue Bottle chỉ được '
+    'gọi là bảo bối tìm kiếm khi nguồn xác nhận chức năng tìm kiếm. Không đặt tên '
+    'đồ vật trong dấu nháy. Quy tắc này ưu tiên hơn yêu cầu giữ tên riêng từ nguồn. '
+    'Dù dữ kiện nguồn, ngữ cảnh '
     'hoặc bản trước bằng tiếng Anh, vẫn kể lại bằng tiếng Việt. '
     'Trước khi trả JSON, tự kiểm tra mọi đơn vị lời kể và chuyển mọi đoạn '
     'tiếng Anh sang tiếng Việt, giữ nguyên ý nghĩa, ID, số đơn vị và bằng chứng.\n'
@@ -36,6 +49,17 @@ def has_direct_dialogue(text):
                 or re.search(r'(?:^|\n)\s*[—–-]\s+\S', text))
 
 
+def require_narrator_text(text, event_id):
+    # A quoted object name needs localization, not dialogue rewriting.
+    if re.search(r'(?i)\b(?:bảo bối|đồ vật|thiết bị|địa danh)\s+[\"\x27“‘]([^\"\x27”’\n]+)[\"\x27”’]', text):
+        raise ValueError('RECAP_NAME_LOCALIZATION:' + event_id
+            + ':Tên đồ vật/địa danh trong dấu nháy phải viết bằng tiếng Việt, bỏ dấu nháy; '
+              'chỉ tên người được giữ tiếng Anh. Dùng mô tả đúng bằng chứng nếu chưa có tên Việt.')
+    if has_direct_dialogue(text):
+        raise ValueError('RECAP_DIRECT_DIALOGUE:' + event_id
+                         + ':rewrite as narrator-only recap; do not quote or copy Whisper')
+
+
 def unsupported_dialogue_fact(fact):
     """Speech content cannot be established by a picture of someone talking."""
     text = str(fact.get('text') or '')
@@ -44,15 +68,23 @@ def unsupported_dialogue_fact(fact):
     return speech and not str(fact.get('spoken_text') or '').strip()
 
 
-def rejected_cached_events(rows, audit_cache):
+def rejected_cached_events(rows, audit_cache, source_identity=None):
     """A structurally valid repair is not reusable after a factual rejection."""
     rejected = set()
+    from transition_contract import narration_boundary, boundary_audit_signature
+    from narration_novelty import novelty_contexts, novelty_signature
+    valid_rows = [r for r in rows or [] if isinstance(r, dict)]
+    contexts = novelty_contexts(valid_rows)
+    previous = None
     for row in rows or []:
         if not isinstance(row, dict):
             continue
-        key = hashlib.sha256(json.dumps([row.get('tts'), row.get('observed_facts'),
-                                        row.get('transition_contract')],
-            sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        from identity_contract import audit_signature
+        key = audit_signature(row, source_identity)
+        key = boundary_audit_signature(key, narration_boundary(previous))
+        if row.get('evidence_sentence_plan_version') or row.get('narration_unit_version'):
+            key = novelty_signature(key, contexts[row.get('scene_id') or row.get('event_id')])
+        previous = row
         verdict = audit_cache.get(key) or {}
         if verdict.get('faithful') is False:
             rejected.add(row.get('event_id'))
@@ -157,19 +189,21 @@ def paragraph_card(event):
         scene_context=event.get('scene_context') or {},
         narrative_role=event.get('story_role') or event.get('narrative_function') or 'development',
         allowed_names=event.get('allowed_character_names') or [], facts=facts,
+        identity_contract=copy.deepcopy(event.get('identity_contract') or {}),
         **({'transition_contract': copy.deepcopy(event['transition_contract'])}
            if event.get('transition_contract') else {}),
         **({'transcript_context_only': context} if context else {}))
 
 
 def paragraph_prompt(events, context, previous=None, error=None):
+    from transition_contract import FIRST_SENTENCE_BRIDGE_RULE
     from character_identity import render_identity_context
     people = context.get('characters') or []
     summaries = [render_identity_context(str(s)[:600], people) for s in context.get('all_part_summaries') or []]
     following = [dict(row, event=render_identity_context(row.get('event', ''), people))
                  for row in context.get('next_batch_context') or [] if isinstance(row, dict)]
     return (
-        VIETNAMESE_WRITER_RULE +
+        VIETNAMESE_WRITER_RULE + FIRST_SENTENCE_BRIDGE_RULE +
         'VIET RECAP THEO CUM SU KIEN, MOI CUM LA MOT DOAN KE LIEN MACH. '
         'CHI VIET LOI NGUOI KE, KHONG CHEP HOI THOAI, KHONG TRICH DAN TRUC TIEP. '
         'Whisper/transcript_context_only CHI GIUP HIEU COT TRUYEN VA NGU CANH; '
@@ -232,9 +266,7 @@ def bind_paragraph(row, event, characters=None):
         raise ValueError('PARAGRAPH_TEXT_INVALID:' + event['event_id'])
     paragraph = _narration_text_normalizer(characters or [])(paragraph)
     require_vietnamese_narration(paragraph, event['event_id'])
-    if has_direct_dialogue(paragraph):
-        raise ValueError('RECAP_DIRECT_DIALOGUE:' + event['event_id']
-                         + ':rewrite as narrator-only recap; do not quote or copy Whisper')
+    require_narrator_text(paragraph, event['event_id'])
     unit_mode = bool(event.get('narration_unit_version'))
     if unit_mode:
         raw_units = row.get('narration_units') or []
@@ -308,6 +340,9 @@ def bind_paragraph(row, event, characters=None):
         [dict(event, visual_sources=sources)], characters=characters)[0]
     scene.update(evidence_sentence_plan_version=VERSION, paragraph_plan_version=2,
                  sentence_slots=copy.deepcopy(event['sentence_slots']))
+    for key in ('identity_contract', 'allowed_character_names', 'visible_character_names', 'mentioned_character_names'):
+        if key in event:
+            scene[key] = copy.deepcopy(event[key])
     if event.get('transition_contract'):
         scene['transition_contract'] = copy.deepcopy(event['transition_contract'])
         scene['transition_contract_version'] = event.get('transition_contract_version', 1)
@@ -323,7 +358,7 @@ def bind_paragraph(row, event, characters=None):
     return scene
 
 
-def writing_batches(events, max_sentences=24, max_chars=18000):
+def writing_batches(events, max_sentences=24, max_chars=8000):
     batch, count, size = [], 0, 0
     for event in events:
         slots = event['sentence_slots']
@@ -419,6 +454,7 @@ def bind_planned_scenes(payload, events, characters=None):
             raise ValueError('SENTENCE_PLAN_ONE_SENTENCE_REQUIRED:' + event['event_id'])
         for unit in units:
             require_vietnamese_narration(unit['text'], event['event_id'])
+            require_narrator_text(unit['text'], event['event_id'])
         raw = {'scenes': [{'event_id': event['event_id'], 'sentences': [
             dict(text=u['text'], fact_ids=s['fact_ids'], visual_id=s['visual_id'], evidence_kind=s['evidence_kind'])
             for u, s in zip(units, slots)]}]}
@@ -434,10 +470,11 @@ def bind_planned_scenes(payload, events, characters=None):
 
 def write_batch(events, context, generate, candidates=None, save=None, characters=None,
                 prompt_builder=None, response_adapter=None, save_raw=None,
-                capacity_error=None, on_split=None):
+                capacity_error=None, on_split=None, timeout_error=None):
     """Keep valid event rows while retrying only missing/invalid events once."""
     from recap_visual_media import parse_writing_response
     ready, error = {}, None
+    event_errors = {}
     drafts = list(candidates or [])
     def accept(payload):
         nonlocal error
@@ -462,6 +499,7 @@ def write_batch(events, context, generate, candidates=None, save=None, character
                 ready[eid] = bind_planned_scenes({'scenes': [row]}, [lookup[eid]], characters)[0]
             except ValueError as exc:
                 error = str(exc)
+                event_errors[eid] = error
     for draft in reversed(drafts):
         try:
             accept(draft)
@@ -503,11 +541,54 @@ def write_batch(events, context, generate, candidates=None, save=None, character
             if following:
                 group_context['next_batch_context'] = following
             try:
-                raw = generate(group, (prompt_builder or writing_prompt)(
-                    group, group_context, drafts[-1] if drafts else None, error))
+                repair_error = '\n'.join(event_errors[e['event_id']] for e in group
+                                         if e['event_id'] in event_errors) or error
+                previous_group = {'scenes': [row for draft in drafts for row in draft.get('scenes', [])
+                    if row.get('event_id') in {e['event_id'] for e in group}]}
+                if (repair_error and len(group) > 1
+                        and all(e.get('narration_unit_version') for e in group)
+                        and response_adapter):
+                    pending[0:0] = [[event] for event in group]
+                    continue
+                request_prompt = (prompt_builder or writing_prompt)(
+                    group, group_context, previous_group if drafts else None, repair_error)
+                # Measure the complete request, including context and repair text.
+                # Split without dropping facts; each child rebuilds its context.
+                if (len(group) == 1 and group[0].get('narration_unit_version')
+                        and response_adapter and repair_error):
+                    from narration_units import generate_unit_chunks
+                    raw = generate_unit_chunks(group[0], group_context, generate,
+                        prompt_builder or writing_prompt, previous_group,
+                        event_errors.get(group[0]['event_id'], repair_error), save_raw=save_raw)
+                elif len(request_prompt) > 15500:
+                    if len(group) > 1:
+                        middle = len(group) // 2
+                        children = [group[:middle], group[middle:]]
+                        pending[0:0] = children
+                        if on_split:
+                            on_split(group, children)
+                        continue
+                    if group[0].get('narration_unit_version') and response_adapter:
+                        from narration_units import generate_unit_chunks
+                        raw = generate_unit_chunks(group[0], group_context, generate,
+                            prompt_builder or writing_prompt, previous_group if drafts else None,
+                            repair_error, save_raw=save_raw)
+                    else:
+                        raise ValueError('WRITER_PROMPT_TOO_LARGE:' + group[0]['event_id']
+                        + ':' + str(len(request_prompt))
+                        + ':single event exceeds soft limit; preserve evidence, do not truncate')
+                else:
+                    raw = generate(group, request_prompt)
             except Exception as exc:
                 persist()
-                if not capacity_error or not capacity_error(exc) or len(group) <= 1:
+                if isinstance(exc, ValueError) and str(exc).startswith('NARRATION_UNIT_'):
+                    error = str(exc)
+                    for event in group:
+                        event_errors[event['event_id']] = error
+                    continue
+                can_split = ((capacity_error and capacity_error(exc))
+                             or (timeout_error and timeout_error(exc)))
+                if not can_split or len(group) <= 1:
                     raise
                 middle = len(group) // 2
                 children = [group[:middle], group[middle:]]
@@ -534,8 +615,31 @@ def write_batch(events, context, generate, candidates=None, save=None, character
 
 def text_audit_prompt(cards):
     return (
+        'RANH GIOI KY THUAT KHONG PHAI DOI DIEN BIEN: cung tinh huong thi '
+        'khong bat cau nao cung co tu noi hay nhac lai cum truoc. Chi yeu cau dinh huong '
+        'khi doi dien bien, thoi gian, dia diem hoac tuyen ke. '
+        'Doc recent_narration va tat ca cau trong tts: moi cau phai them thong tin. '
+        'Trung y du doi chu: faithful=false, reason="duplicate_narration:" kem cau/scene lap. '
+        'Lap mot phan thi chi bo phan lap va giu thong tin moi; cung hanh dong o lan khac '
+        'co bang chung thi khong phai lap. Khong chap nhan dien dat lai de du so cau. '
+        'Kiem tra trang thai HOAT DONG: da xong thi khong duoc noi dang lam; '
+        'neu chua ro thi khong tu khang dinh da xong hay dong thoi. '
+        'KIEM TRA MACH GIUA HAI CUM: doc previous_scene.tts va cau dau tts hien tai. '
+        'Khong cham tung cum doc lap. Neu previous_scene co noi dung thi phai '
+        'kiem tra quan he giua ket cum truoc va dau cum nay, ke ca qua batch. '
+        'Khi da DOI DIEN BIEN, chi neu dia diem "Tai khu rung..." chua du khi cung nhan vat vua ket thuc '
+        'hanh dong khac: can moc hanh dong cuoi hoac bao chuyen tuyen/thoi diem phu hop. '
+        'Cung hanh trinh ma noi "trong mot dien bien khac" la noi sai. '
+        'Menh de "sau khi bi danh bai, Nobita..." sai neu nguoi bi danh bai la Doraemon. '
+        'Khong yeu cau bia di chuyen, dong thoi hay nhan qua de noi cho em. '
+        'Neu thieu dien bien hoac sai actor: faithful=false, reason bat dau '
+        '"transition_state_conflict:"; neu thieu moc noi: "transition_bridge_missing:". '
         'KIEM CHUNG LOI KE VOI BANG CHUNG DA QUAN SAT, khong viet lai. '
         'Moi scene_id tra faithful=true chi khi TAT CA menh de duoc observed_facts '
+        'hoac spoken_text ro rang trong fact ho tro. identity_contract phan biet nguoi '
+        'co mat va nguoi chi duoc nhac; nguoi chi duoc nhac khong duoc bien thanh actor '
+        'dang hanh dong trong hinh. Khong coi tu thuong nhu "gian kho" la ten Gian. '
+        'Ten phu/quan he/loai sinh vat phai co bang chung; chua ro dung mo ta trung tinh. '
         'ho tro; khong chap nhan suy doan nguoi, hanh dong, noi tam, nguyen nhan hay '
         'ket qua. Chi kiem tra dieu cau thuc su ke, khong bat ke het facts. '
         'Nhieu cau duoc cung tham chieu mot fact neu ke cac chi tiet khac nhau '
@@ -544,8 +648,16 @@ def text_audit_prompt(cards):
         'buoc hanh dong khac nhau cua cung mot su kien. '
         'Neu co transition_contract, cau chu duoc phep da dang nhung Y NGHIA chuyen mach '
         'phai dung relation va cac anchor trong contract. Contract chi ho tro moi lien he/anchor '
+        'duoc ghi. requires_bridge=true: cau dau phai noi quan he da xac nhan hoac gioi thieu '
+        'boi canh/chu the moi; neu nhay canh khong co cau noi, tra faithful=false voi reason '
+        'bat dau "transition_bridge_missing:". Khong bat mot tu noi cu the; dia diem/chu the '
+        'duoc gioi thieu dung cung la cau noi. Khong suy ra thu tu thoi gian tu thu tu video; '
+        'hoan thanh, dong thoi, muc dich va nhan qua deu can bang chung. Contract chi ho tro moi lien he/anchor '
         'duoc ghi, khong cho phep them chi tiet hien tai. neutral_reintroduction khong duoc ngam '
-        'chi quan he truoc-sau hay nhan-qua. Khong bac bo chi vi writer khong chep dung mot cum tu mau. '
+        'chi quan he truoc-sau hay nhan-qua. Voi relation nay, dinh vi ro chu the, noi chon '
+        'hoac tinh huong moi bang facts la du; khong yeu cau giai thich tai sao phim cat canh. '
+        'Quy tac nay uu tien hon yeu cau moc lai hanh dong cuoi khi quan he chua ro. '
+        'Khong bac bo chi vi writer khong chep dung mot cum tu mau. '
         'Loi thoai chi ho tro noi dung duoc noi. Khong goi day la da kiem chung video. '
         'Recap phai la loi nguoi ke: trich hoi thoai truc tiep hoac chep phien am '
         'vo nghia tu Whisper thi faithful=false; yeu cau ke gian tiep tu bang chung ro nghia. '
@@ -563,21 +675,24 @@ AUDIT_SCHEMA = {'type': 'object', 'properties': {'checks': {'type': 'array', 'it
 
 def audit_planned_payload(payload, text_check, video_check, text_cache=None, video_cache=None,
                          save_text=None, save_video=None, cache_only=False,
-                         source_identity=None, source_offset=0.0):
+                         source_identity=None, source_offset=0.0, diagnostic=None):
     """Text evidence first; video is reserved for explicit visual uncertainty."""
     from grounded_pipeline import audit_narrations
     checked = audit_narrations(payload, text_check, checkpoint=text_cache,
-        save=save_text, max_attempts=0 if cache_only else 2)
+        save=save_text, max_attempts=0 if cache_only else 2,
+        source_identity=source_identity, diagnostic=diagnostic)
     risky = {s['scene_id'] for p in checked['parts'] for s in p.get('scenes') or []
-             if any(str(error).startswith('unsupported_narration:visual_review_required:')
-                    for error in s.get('visual_alignment_errors') or [])}
+             if s.get('audit_verdict_conflict') or any(str(error).startswith(
+                 'unsupported_narration:visual_review_required:')
+                 for error in s.get('visual_alignment_errors') or [])}
     if risky:
         subset = copy.deepcopy(checked)
         for part in subset['parts']:
             part['scenes'] = [s for s in part.get('scenes') or [] if s['scene_id'] in risky]
         reviewed = audit_narrations(subset, video_check, checkpoint=video_cache,
             save=save_video, visual_evidence=True, source_identity=source_identity,
-            visual_source_offset=source_offset, max_attempts=0 if cache_only else 1)
+            visual_source_offset=source_offset, max_attempts=0 if cache_only else 1,
+            diagnostic=diagnostic)
         replacements = {s['scene_id']: s for p in reviewed['parts'] for s in p.get('scenes') or []}
         for part in checked['parts']:
             part['scenes'] = [replacements.get(s['scene_id'], s) for s in part.get('scenes') or []]

@@ -4,7 +4,7 @@ import math
 import re
 import unicodedata
 
-VERSION = 3
+VERSION = 4
 
 
 def needs_identity_rebuild(checkpoint):
@@ -63,6 +63,9 @@ def dialogue_name_mentions(text, names):
     for width in {len(parts) for parts in normalized.values() if parts}:
         for i in range(len(words) - width + 1):
             phrase = ' '.join(words[i:i + width])
+            if width == 1 and phrase == 'gian' and i + 1 < len(words) and words[i + 1] in {
+                    'kho', 'nan', 'truan', 'lao', 'doi', 'xao', 'tra', 'ac', 'tham'}:
+                continue
             if width == 1 and i and (
                     phrase == 'gian' and words[i - 1] in {'thoi', 'khong', 'trung', 'the', 'nhan'}
                     or phrase == 'nam' and words[i - 1] == 'viet'):
@@ -81,8 +84,8 @@ def dialogue_name_mentions(text, names):
 
 def render_ids(text, labels, allow_bare=True):
     labels = {str(k).upper(): str(v) for k, v in labels.items()}
-    text = re.sub(r'\[CHAR=([A-Za-z0-9_]+)\]',
-        lambda m: labels.get(m[1].upper(), 'nhân vật chưa xác định'), str(text), flags=re.I)
+    text = re.sub(r'\[(?:CHAR=([A-Za-z0-9_]+)|([CP]\d+))\]',
+        lambda m: labels.get((m[1] or m[2]).upper(), 'nhân vật chưa xác định'), str(text), flags=re.I)
     if not allow_bare:
         return text
     return re.sub(r'(?<!\w)([CP]\d+)(?!\w)',
@@ -215,6 +218,25 @@ def profile(character, transcript=None, valid_shots=None, strict=False):
         alias = f'nhân vật chưa rõ tên {int(cid[1:]) if cid else 1}'
     result['neutral_alias'] = alias
     result['display_name'] = result['name'] or alias
+    role = str(result.get('role') or '').casefold()
+    result['identity_group'] = ('main' if role in ('protagonist', 'antagonist', 'main')
+                                or result.get('identity_group') == 'main' else 'supporting')
+    result['entity_kind'] = result.get('entity_kind') if result.get('entity_kind') in (
+        'person', 'animal', 'creature', 'unknown') else 'unknown'
+    result['naming_basis'] = 'source_name' if confirmed else 'visual_description'
+    relation = result.get('relationship_evidence')
+    relation_proved = (isinstance(relation, dict) and bool(clean_list(relation.get('shot_ids')))
+        and bool(str(relation.get('quote') or relation.get('description') or '').strip())
+        and (valid_shots is None or set(clean_list(relation.get('shot_ids'))) <= set(valid_shots)))
+    relation_label = next((label for label in (result['display_name'], alias)
+        if re.search(r'\b(?:bố|mẹ|cha|con|anh|chị|em)\s+của\b', label, re.I)), '')
+    if relation_label and not relation_proved:
+        result['relationship_alias_candidate'] = relation_label
+        if result.get('name') == relation_label:
+            result.update(name='', name_status='candidate', name_verified=False, aliases=[],
+                          naming_basis='visual_description')
+        result['neutral_alias'] = f'nhân vật chưa rõ tên {int(cid[1:]) if cid else 1}'
+        result['display_name'] = result['name'] or result['neutral_alias']
     for field in ('stable_features', 'face_features', 'body_features', 'distinctive_features',
                   'appearance_variants', 'reference_shot_ids'):
         result[field] = clean_list(result.get(field))
@@ -265,7 +287,8 @@ def merge_profile(base, observed):
 
 def compact_registry(rows):
     """Send descriptions, not the complete appearance history or image files."""
-    fields = ('id', 'name', 'name_status', 'display_name', 'neutral_alias', 'visual_signature', 'identity_conflict')
+    fields = ('id', 'name', 'name_status', 'display_name', 'neutral_alias', 'visual_signature', 'identity_conflict',
+              'identity_group', 'entity_kind', 'naming_basis', 'relationship_evidence')
     result = []
     for row in rows:
         item = {k: row[k] for k in fields if row.get(k)}

@@ -186,6 +186,9 @@ def bind_written_scenes(payload, events, characters=None):
                    sentence_proofs=proofs, source_grounded_writer_version=VERSION,
                    observed_facts=copy.deepcopy(event.get('observed_facts') or []))
         row.update(plan)
+        for key in ('identity_contract', 'allowed_character_names', 'visible_character_names', 'mentioned_character_names'):
+            if key in event:
+                row[key] = copy.deepcopy(event[key])
         if unit_mode:
             row['narration_unit_version'] = 1
         row['source_grounded_signature'] = signature(row)

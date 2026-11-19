@@ -5,9 +5,24 @@ free to choose natural Vietnamese wording; no connector phrase is whitelisted.
 """
 import copy
 import re
+import hashlib
+import json
 
 
-VERSION = 1
+VERSION = 3
+
+
+def narration_boundary(previous):
+    if previous is None:
+        return None
+    sid = previous.get('scene_id') or re.sub(r'^E(?=\d+$)', 'S', str(previous.get('event_id') or ''))
+    return {'scene_id': sid, 'tts': previous.get('tts', ''),
+            'observed_facts': copy.deepcopy(previous.get('observed_facts') or [])}
+
+
+def boundary_audit_signature(signature, boundary):
+    return hashlib.sha256(json.dumps([VERSION, signature, boundary],
+        ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 _EXPLICIT = {
     'continuation': 'continuation',
     'time_jump': 'time_jump',
@@ -35,6 +50,26 @@ def _known(value):
     return value if value.casefold() not in _GENERIC_CONTEXT else ''
 
 
+def time_dimensions(value):
+    """Compare like time dimensions; an era and daylight can coexist."""
+    text = _known(value).casefold()
+    result = {}
+    for key, pattern in (
+        ('era', r'thế kỷ\s*\d+|tiền sử|hiện đại|cổ đại'),
+        ('day', r'ngày hôm sau|hôm sau|hôm trước|cùng ngày'),
+        ('daylight', r'ban ngày|ban đêm|đêm'),
+        ('dayperiod', r'buổi sáng|buổi trưa|buổi chiều|buổi tối|hoàng hôn|bình minh')):
+        match = re.search(pattern, text)
+        if match:
+            result[key] = match.group().replace('ngày hôm sau', 'hôm sau').replace('ban đêm', 'đêm')
+    return result
+
+
+def confirmed_time_change(left, right):
+    a, b = time_dimensions(left), time_dimensions(right)
+    return any(a[key] != b[key] for key in a.keys() & b.keys())
+
+
 def _characters(event):
     values = event.get('characters') or event.get('character_ids') or []
     if isinstance(values, str):
@@ -48,6 +83,19 @@ def _anchor(event, fields):
         if value:
             return value
     return ''
+
+
+def boundary_state(event, tail=False):
+    """Source facts, not guessed travel or chronology, describe each boundary."""
+    facts = [dict(fact_id=f.get('fact_id'), text=f.get('text'),
+                  actor_ids=f.get('canonical_actor_ids') or f.get('actor_ids') or [])
+             for f in event.get('observed_facts') or [] if isinstance(f, dict)]
+    return {'event_id': event.get('event_id'),
+            'characters': _characters(event),
+            'scene_context': copy.deepcopy(event.get('scene_context') or {}),
+            'activity_state': _anchor(event, ('state_after', 'outcome', 'result') if tail
+                                      else ('state_before', 'cause')),
+            'facts': facts[-2:] if tail else facts[:2]}
 
 
 def _contract(previous, current, first=False):
@@ -106,7 +154,7 @@ def _contract(previous, current, first=False):
         if previous_location and current_location and previous_location.casefold() != current_location.casefold():
             relation, confidence = 'location_change', 0.85
             basis.append('confirmed_location_change')
-        elif previous_time and current_time and previous_time.casefold() != current_time.casefold():
+        elif confirmed_time_change(previous_time, current_time):
             relation, confidence = 'time_jump', 0.82
             basis.append('confirmed_time_context_change')
         elif same_situation or same_beat:
@@ -152,6 +200,8 @@ def _contract(previous, current, first=False):
         'current_event_id': current.get('event_id'),
         'previous_anchor': previous_anchor,
         'current_anchor': current_anchor,
+        'previous_end_state': boundary_state(previous, tail=True),
+        'current_start_state': boundary_state(current),
         'previous_characters': previous_ids,
         'current_characters': current_ids,
         'previous_location': previous_location,
@@ -170,13 +220,49 @@ def _contract(previous, current, first=False):
     }
 
 
+FIRST_SENTENCE_BRIDGE_RULE = (
+    'CHI NOI KHI DOI DIEN BIEN, THOI GIAN HOAC TUYEN KE; ranh gioi event/batch/ID '
+    'khong tu dong la ranh gioi dien bien. Cac cau cung dien bien ke tiep tu nhien, '
+    'khong ep nhac lai hanh dong cu hoac chen tu noi. '
+    'KIEM TRA RANH GIOI: doi chieu previous_end_state va current_start_state. '
+    'Khi doi dien bien, cau dau phai cho nguoi nghe hieu dang theo ai, o dau, tiep viec gi. '
+    'Khi doi dien bien: hieu HOAT DONG truoc da xong hay con dang dien ra, '
+    'khong chi chep chi tiet cuoi cum truoc. Neu bat ca da ket thuc, co the viet '
+    '"Sau khi bat ca xong, Kukuru nhin thay cot khoi tu xa"; khong viet "Dang bat ca" '
+    'neu mau thuan trang thai da ket thuc; '
+    'khong tu them "tro ve lang" neu khong co fact chung minh. '
+    'Doi tuyen khong ro dong thoi: dung "Cau chuyen chuyen sang..." hoac '
+    '"O phia..."; khong bien nhan vat cua canh truoc thanh chu the canh sau. '
+    'Cung hanh trinh thi tiep mach, khong dung "trong mot dien bien khac". '
+    'Thieu su kien bi bat/di chuyen thi khong dung tu noi de che lap cho trong: '
+    'chi ke trang thai moi duoc chung minh, bao ro doi tuyen. '
+    'CAU RECAP DAU CANH MOI: doc canh truoc va transition_contract, roi viet ngay '
+    'cau recap dau tien vua noi mach truoc vua ke hanh dong/bien co moi. '
+    'Khong them cau noi rieng, khong them unit, khong tang quota, khong tom tat lai ca cum truoc. '
+    'Neu nguon xac nhan bat ca da xong va cau be ve lang, co the viet '
+    '"Bat ca xong, cau be tro ve lang va phat hien ..."; chi dung khi tung ve co bang chung. '
+    'Doi tuyen thi gioi thieu chu the/noi moi ngay trong cau recap dau. '
+    'Khong dung "trong khi do" neu chua xac nhan dong thoi; quan he chua ro thi '
+    'gioi thieu boi canh hien tai trung tinh. Ap dung ca ranh gioi batch va phan. '
+    'Voi neutral_reintroduction, neu viec moi khong ro lien he voi viec truoc, '
+    'mo cau bang chu the, noi chon hoac tinh huong moi da xac nhan. '
+    'Khong can giai thich vi sao phim chuyen sang viec moi. '
+)
+
+
 def apply_transition_contracts(plan):
     """Attach one global, source-ordered boundary contract to every event."""
     result = copy.deepcopy(plan)
     events = [event for group in result.get('events_by_part') or [] for event in group]
     previous = None
+    actor_states = {}
     for event in events:
         contract = _contract(previous, event, first=previous is None)
+        # A returning storyline can be separated by many unrelated scenes.
+        # Keep source states, not an invented narrative recap of the gap.
+        contract['returning_actor_states'] = {
+            actor: copy.deepcopy(actor_states[actor]) for actor in _characters(event)
+            if actor in actor_states and actor_states[actor]['event_id'] != (previous or {}).get('event_id')}
         event['transition_contract'] = contract
         event['transition_contract_version'] = VERSION
         slots = event.get('sentence_slots') or []
@@ -186,5 +272,7 @@ def apply_transition_contracts(plan):
             else:
                 slot.pop('transition_contract', None)
         previous = event
+        for actor in _characters(event):
+            actor_states[actor] = boundary_state(event, tail=True)
     result['transition_contract_version'] = VERSION
     return result

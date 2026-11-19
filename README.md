@@ -14,7 +14,24 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Sau đó mở `http://127.0.0.1:5000` và nhập Gemini API key trên giao diện.
+Sau đó mở `http://127.0.0.1:5001` và nhập Gemini API key trên giao diện.
+
+### Giọng Ngọc Huyền local trên Windows
+
+Mã tích hợp và mã ViFastTts đi kèm. Giọng Hoài Mỹ và Nam Minh dùng Edge TTS;
+hai giọng này không cần cài model local. Để dùng giọng local trong môi trường
+được phép, tạo môi trường riêng và cài các thư viện chạy ONNX:
+
+```powershell
+python -m venv local_tts\venv
+.\local_tts\venv\Scripts\python.exe -m pip install numpy onnxruntime
+```
+
+Đặt cặp `acoustic.onnx` và `vocoder.onnx` tương thích vào `local_tts/models/`.
+Bộ model Ngọc Huyền do ViFastTts công bố dành cho sử dụng phi thương mại và
+không nằm trong gói bàn giao. Xem [trang model](https://huggingface.co/dvchd/vifasttts-ngochuyen-small).
+Mã ViFastTts đi kèm dùng giấy phép MIT hoặc Apache-2.0, đính kèm trong
+`local_tts/ViFastTts/`.
 
 Muốn tự động sao chép video sau khi render, sao chép
 `app_settings.example.json` thành `app_settings.json`, rồi đặt

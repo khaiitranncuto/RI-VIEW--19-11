@@ -12,9 +12,20 @@ def inspect_sentence_visual_contract(payload, target, duration=None, *, require_
     if source_path is not None and not os.path.isfile(source_path):
         issues.append({'code': 'SOURCE_VIDEO_MISSING'})
     scenes = [s for p in payload.get('parts') or [] for s in p.get('scenes') or []]
+    from narration_novelty import duplicate_sentences
+    issues.extend(duplicate_sentences(scenes))
     total = 0
     for scene in scenes:
         sid = scene.get('scene_id') or scene.get('event_id')
+        fallback = scene.get('visual_fallback')
+        content_errors = list(scene.get('visual_alignment_errors') or [])
+        if isinstance(fallback, dict):
+            content_errors.extend(fallback.get('reasons') or [])
+        if any('duplicate_narration:' in str(error) for error in content_errors):
+            issues.append(dict(code='DUPLICATE_NARRATION', scene_id=sid))
+        if any('transition_state_conflict:' in str(error) or 'transition_bridge_missing:' in str(error)
+               for error in content_errors):
+            issues.append(dict(code='NARRATION_FLOW_CONFLICT', scene_id=sid))
         proofs = scene.get('sentence_proofs') or []
         unit_mode = bool(scene.get('narration_unit_version'))
         texts = [p.get('text', '') for p in proofs] if unit_mode else sentence_texts(scene.get('tts') or '')

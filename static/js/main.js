@@ -26,6 +26,40 @@ const state = {
 };
 
 let apiVerificationTimer = null;
+const voiceSettingFields = {pitch: 'Cao độ', warmth: 'Độ ấm', clarity: 'Độ sáng / rõ chữ', energy: 'Năng lượng giọng', volume: 'Âm lượng'};
+function currentVoiceSettings() {
+    return Object.fromEntries(Object.keys(voiceSettingFields).map(key => [key, Number(document.getElementById(`voice-setting-${key}`)?.value ?? 50)]));
+}
+document.addEventListener('DOMContentLoaded', () => {
+    const container = document.getElementById('voice-controls');
+    const select = document.getElementById('voice-select');
+    if (!container || !select) return;
+    const readSaved = () => { try { return JSON.parse(localStorage.getItem('voice_settings_v1') || '{}'); } catch (_) { return {}; } };
+    function load(values = readSaved()[select.value] || {}) {
+        container.innerHTML = '';
+        for (const [key, label] of Object.entries(voiceSettingFields)) {
+            const value = Math.max(0, Math.min(100, Number(values[key] ?? 50)));
+            const row = document.createElement('div');
+            row.style.marginTop = '18px';
+            row.innerHTML = `<label for="voice-setting-${key}">${label} <span class="badge-value" id="voice-value-${key}">${value}</span></label>
+                <div style="position:relative;margin-top:10px"><span style="position:absolute;left:50%;top:0;height:20px;width:2px;background:#94a3b8;pointer-events:none"></span><input id="voice-setting-${key}" type="range" min="0" max="100" step="1" value="${value}" style="position:relative;width:100%"></div>
+                <div class="slider-labels"><span>0 (−50)</span><span>50</span><span>100 (+50)</span></div>`;
+            container.appendChild(row);
+            row.querySelector('input').oninput = event => {
+                document.getElementById(`voice-value-${key}`).textContent = event.target.value;
+                document.getElementById('voice-save-status').textContent = 'Chưa lưu';
+            };
+        }
+    }
+    select.addEventListener('change', () => { load(); document.getElementById('voice-save-status').textContent = ''; });
+    document.getElementById('save-voice-settings').onclick = () => {
+        const saved = readSaved(); saved[select.value] = currentVoiceSettings();
+        localStorage.setItem('voice_settings_v1', JSON.stringify(saved));
+        document.getElementById('voice-save-status').textContent = 'Đã lưu cho giọng này';
+    };
+    document.getElementById('reset-voice-settings').onclick = () => { load({}); document.getElementById('voice-save-status').textContent = 'Đã đặt lại — chưa lưu'; };
+    load();
+});
 let apiVerificationController = null;
 let apiVerificationRevision = 0;
 
@@ -141,6 +175,117 @@ const dom = {
     backButtons: document.querySelectorAll('.btn-back'),
     toastContainer: document.getElementById('toast-container')
 };
+
+// Persist user-owned UI choices between tool restarts. Project output (script,
+// sentences and task progress) deliberately stays outside this preferences
+// object; those values have their own lifecycle.
+const UI_PREFERENCES_KEY = 'review_tool_ui_preferences_v1';
+const persistedControlIds = [
+    'model-select', 'thinking-effort-select', 'video-select', 'style-select',
+    'review-minutes', 'enable-multi-voice', 'voice-select', 'voice-rate-slider',
+    'gemini-voice-select', 'gemini-voice-style', 'bgm-select',
+    'bgm-volume-slider', 'filter-mirror', 'filter-zoom', 'filter-ken-burns',
+    'filter-contrast', 'filter-speed', 'enable-subtitles',
+    'enable-karaoke-sub', 'sub-size', 'sub-color', 'sub-opacity',
+    'export-mode', 'render-engine'
+];
+
+function readUiPreferences() {
+    try {
+        const value = JSON.parse(localStorage.getItem(UI_PREFERENCES_KEY) || '{}');
+        return value && typeof value === 'object' ? value : {};
+    } catch (_) {
+        return {};
+    }
+}
+
+function savedControlValue(id) {
+    return readUiPreferences().controls?.[id];
+}
+
+function restoreControlValue(control, savedValue) {
+    if (!control || savedValue === undefined) return false;
+    if (control.type === 'checkbox') {
+        control.checked = Boolean(savedValue);
+        return true;
+    }
+    if (control.tagName === 'SELECT' &&
+        !Array.from(control.options).some(option => option.value === String(savedValue))) {
+        return false;
+    }
+    control.value = String(savedValue);
+    return true;
+}
+
+function restoreUiPreferences() {
+    const preferences = readUiPreferences();
+    const controls = preferences.controls || {};
+    persistedControlIds.forEach(id => restoreControlValue(document.getElementById(id), controls[id]));
+
+    const aspectRatio = preferences.aspect_ratio;
+    const aspectInput = aspectRatio
+        ? document.querySelector(`input[name="aspect_ratio"][value="${CSS.escape(String(aspectRatio))}"]`)
+        : null;
+    if (aspectInput) aspectInput.checked = true;
+    updateAspectRatioCards();
+    syncPersistedUiDisplays();
+}
+
+function updateAspectRatioCards() {
+    document.querySelectorAll('.ratio-card').forEach(card => {
+        const selected = Boolean(card.querySelector('input[name="aspect_ratio"]')?.checked);
+        card.style.borderColor = selected ? '#3b82f6' : '#444';
+        card.style.borderWidth = selected ? '2px' : '1px';
+        card.style.background = selected ? 'rgba(59, 130, 246, 0.1)' : 'rgba(255, 255, 255, 0.05)';
+    });
+}
+
+function syncPersistedUiDisplays() {
+    if (dom.voiceRateVal && dom.voiceRateSlider) {
+        const rate = Number(dom.voiceRateSlider.value);
+        dom.voiceRateVal.textContent = `${rate >= 0 ? '+' : ''}${rate}%`;
+    }
+    if (dom.bgmVolumeVal && dom.bgmVolumeSlider) {
+        dom.bgmVolumeVal.textContent = `${dom.bgmVolumeSlider.value}%`;
+    }
+    const subtitles = document.getElementById('enable-subtitles');
+    if (subtitles) {
+        const previewBox = document.getElementById('subtitle-preview-box');
+        if (previewBox) previewBox.style.opacity = subtitles.checked ? '1' : '0.3';
+        [dom.subSize, dom.subColor, dom.subOpacity].forEach(control => {
+            if (control) control.disabled = !subtitles.checked;
+        });
+    }
+}
+
+function saveUiPreferences() {
+    const previous = readUiPreferences();
+    const controls = { ...(previous.controls || {}) };
+    persistedControlIds.forEach(id => {
+        const control = document.getElementById(id);
+        if (!control) return;
+        controls[id] = control.type === 'checkbox' ? control.checked : control.value;
+    });
+    const aspectRatio = document.querySelector('input[name="aspect_ratio"]:checked')?.value || '';
+    localStorage.setItem(UI_PREFERENCES_KEY, JSON.stringify({ controls, aspect_ratio: aspectRatio }));
+}
+
+function setupUiPreferencePersistence() {
+    let inputTimer = null;
+    document.addEventListener('change', event => {
+        const target = event.target;
+        if (persistedControlIds.includes(target?.id) || target?.name === 'aspect_ratio') {
+            if (target?.name === 'aspect_ratio') updateAspectRatioCards();
+            saveUiPreferences();
+        }
+    });
+    document.addEventListener('input', event => {
+        if (!persistedControlIds.includes(event.target?.id)) return;
+        window.clearTimeout(inputTimer);
+        inputTimer = window.setTimeout(saveUiPreferences, 120);
+    });
+    window.addEventListener('beforeunload', saveUiPreferences);
+}
 
 // =====================================================================
 // HELPER FUNCTIONS
@@ -740,7 +885,7 @@ async function verifyApiKey(showSuccessToast = true, expectedRevision = null) {
 
 async function loadVideosList() {
     try {
-        const previousVideo = state.selectedVideo || dom.videoSelect.value;
+        const previousVideo = state.selectedVideo || savedControlValue('video-select') || dom.videoSelect.value;
         const res = await fetch('/api/list-videos');
         const list = await res.json();
         
@@ -760,6 +905,12 @@ async function loadVideosList() {
             if (automaticVideo !== state.selectedVideo) resetProjectData(automaticVideo);
             checkNextStep1Availability();
             await loadVideoDurationSuggestion(automaticVideo);
+            const savedVideo = savedControlValue('video-select');
+            const savedMinutes = savedControlValue('review-minutes');
+            if (savedVideo === automaticVideo && savedMinutes !== undefined) {
+                dom.reviewMinutes.value = savedMinutes;
+                updateReviewMinutesHint();
+            }
         }
     } catch (err) {
         showToast('Không thể tải danh sách video.', 'error');
@@ -808,6 +959,7 @@ async function loadBgmsList() {
             opt.textContent = bgm;
             dom.bgmSelect.appendChild(opt);
         });
+        restoreControlValue(dom.bgmSelect, savedControlValue('bgm-select'));
     } catch (err) {
         showToast('Không thể tải danh sách nhạc nền BGM.', 'error');
     }
@@ -1382,6 +1534,7 @@ function renderSentences() {
                     body: JSON.stringify({
                         text: txt,
                         voice: dom.voiceSelect.value,
+                        voice_settings: currentVoiceSettings(),
                         rate: `${parseInt(dom.voiceRateSlider.value) >= 0 ? '+' : ''}${dom.voiceRateSlider.value}%`
                     })
                 });
@@ -1532,6 +1685,7 @@ async function submitRenderVideo() {
         bgm_name: dom.bgmSelect.value,
         bgm_volume: parseInt(dom.bgmVolumeSlider.value),
         voice_name: dom.voiceSelect.value,
+        voice_settings: currentVoiceSettings(),
         voice_rate: `${dom.voiceRateSlider.value >= 0 ? '+' : ''}${dom.voiceRateSlider.value}%`,
         sentences: state.sentences,
         mirror: dom.filterMirror.checked,
@@ -1876,6 +2030,7 @@ function setupEventListeners() {
             resetProjectData(filename);
             checkNextStep1Availability();
             loadVideoDurationSuggestion(filename);
+            saveUiPreferences();
         });
     });
     
@@ -1964,6 +2119,7 @@ function setupEventListeners() {
     setupDragAndDrop(dom.bgmDropZone, dom.bgmFileInput, dom.bgmUploadProgress, 'bgm', (filename) => {
         loadBgmsList().then(() => {
             dom.bgmSelect.value = filename;
+            saveUiPreferences();
         });
     });
     
@@ -2036,7 +2192,13 @@ function setupEventListeners() {
 // DOCUMENT ON READY
 // =====================================================================
 document.addEventListener('DOMContentLoaded', () => {
-    loadInitialData().then(resumePersistedRender);
+    restoreUiPreferences();
+    loadInitialData().then(() => {
+        // Bind only after asynchronous selects have their options, so a fast
+        // close cannot replace a previously saved choice with a loading value.
+        setupUiPreferencePersistence();
+        resumePersistedRender();
+    });
     loadSfxList();
     loadExportDirectory();
     setupEventListeners();
@@ -2186,15 +2348,15 @@ function updateSubtitlePreviewBackground(videoFilename) {
             const res = await fetch('/api/preview-tts', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: sampleText, voice, rate })
+                body: JSON.stringify({ text: sampleText, voice, rate, voice_settings: currentVoiceSettings() })
             });
             const data = await res.json();
             
             if (data.success) {
                 audio.src = data.url + '?t=' + Date.now();
-                audio.style.display = 'block';
-                audio.play();
-                status.textContent = '✅ Đang phát';
+                audio.style.display = 'none';
+                await audio.play();
+                status.textContent = '✅ Đang phát với thông số vừa chỉnh';
                 status.style.color = '#4ade80';
             } else {
                 status.textContent = '❌ ' + (data.message || 'Lỗi');
@@ -2209,5 +2371,53 @@ function updateSubtitlePreviewBackground(videoFilename) {
         btn.innerHTML = '<i class="fa-solid fa-headphones"></i> Nghe thử giọng';
         
         setTimeout(() => { status.style.display = 'none'; }, 5000);
+    };
+})();
+
+// Gemini 3.1 voice lab: audition a Vietnamese narration style before choosing
+// whether to use Gemini as a future render voice provider.
+(function() {
+    const btn = document.getElementById('btn-preview-gemini-voice');
+    if (!btn) return;
+    const audio = document.getElementById('gemini-voice-preview-audio');
+    const status = document.getElementById('gemini-voice-preview-status');
+    const voiceSelect = document.getElementById('gemini-voice-select');
+    const styleInput = document.getElementById('gemini-voice-style');
+    const rateSlider = document.getElementById('voice-rate-slider');
+    const sampleText = 'Trong thế giới đầy bí ẩn này, một cuộc phiêu lưu mới đang bắt đầu. Liệu nhân vật chính có thể vượt qua mọi thử thách và tìm ra sự thật?';
+
+    btn.onclick = async () => {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Ngọc Huyền đang đọc...';
+        status.style.display = 'inline';
+        status.textContent = '';
+        audio.pause();
+        audio.style.display = 'none';
+        try {
+            const res = await fetch('/api/preview-local-tts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    text: sampleText,
+                    voice: voiceSelect.value,
+                    style: styleInput.value,
+                    voice_settings: currentVoiceSettings(),
+                    rate: `${Number(rateSlider?.value || 20) >= 0 ? '+' : ''}${rateSlider?.value || 20}%`
+                })
+            });
+            const data = await res.json();
+            if (!data.success) throw new Error(data.message || 'Gemini không tạo được âm thanh.');
+            audio.src = data.url + '?t=' + Date.now();
+            audio.style.display = 'block';
+            await audio.play();
+            status.textContent = `✅ ${data.voice || voiceSelect.value}`;
+            status.style.color = '#4ade80';
+        } catch (error) {
+            status.textContent = '❌ ' + (error.message || 'Lỗi tạo giọng Gemini');
+            status.style.color = '#f87171';
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fa-solid fa-headphones"></i> Nghe thử Ngọc Huyền';
+        }
     };
 })();

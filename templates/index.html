@@ -426,11 +426,12 @@
                         <div class="card glass">
                             <h3 class="card-title"><i class="fa-solid fa-microphone"></i> Cấu Hình Lồng Tiếng</h3>
                             <div class="form-group">
-                                <label for="voice-select">Giọng Đọc AI (Edge-TTS)</label>
+                                <label for="voice-select">Giọng Đọc AI</label>
                                 <select id="voice-select">
                                     <optgroup label="🇻🇳 Giọng Việt Nam">
                                         <option value="vi-VN-HoaiMyNeural" selected>Hoài Mỹ (Nữ - Mượt mà)</option>
                                         <option value="vi-VN-NamMinhNeural">Nam Minh (Nam - Kịch tính)</option>
+                                        <option value="local:ngochuyen">Ngọc Huyền (Nữ miền Bắc — Local)</option>
                                     </optgroup>
                                     <optgroup label="🌐 Giọng Đa Ngôn Ngữ (Hot trên YouTube)">
                                         <option value="en-US-AndrewMultilingualNeural">Andrew (Nam - Trầm ấm, kể chuyện)</option>
@@ -444,16 +445,34 @@
                                     <i class="fa-solid fa-headphones"></i> Nghe thử giọng
                                 </button>
                                 <span id="voice-preview-status" style="margin-left:8px;font-size:12px;color:#a78bfa;display:none;"></span>
-                                <audio id="voice-preview-audio" style="display:none;width:100%;margin-top:8px;height:36px;border-radius:8px;" controls></audio>
+                                <audio id="voice-preview-audio" hidden></audio>
                             </div>
                             <div class="form-group">
                                 <label for="voice-rate-slider">Tốc độ đọc: <span class="badge-value" id="voice-rate-val">+20%</span></label>
-                                <input type="range" id="voice-rate-slider" min="-20" max="50" step="5" value="20">
-                                <div class="slider-labels">
+                                <input type="range" id="voice-rate-slider" min="20" max="20" value="20" hidden style="display:none">
+                                <div id="voice-controls"></div>
+                                <button type="button" id="save-voice-settings" class="btn btn-primary">Lưu thiết lập</button>
+                                <button type="button" id="reset-voice-settings" class="btn btn-secondary">Đặt lại</button>
+                                <span id="voice-save-status" role="status"></span>
+                                <div class="slider-labels" hidden style="display:none">
                                     <span>Chậm</span>
                                     <span>Bình thường</span>
                                     <span>Nhanh</span>
                                 </div>
+                            </div>
+                            <div hidden style="display:none">
+                                <label for="gemini-voice-select">Ngọc Huyền — chạy local</label>
+                                <select id="gemini-voice-select">
+                                    <option value="ngochuyen" selected>Ngọc Huyền — nữ miền Bắc, local CPU</option>
+                                </select>
+                                <textarea id="gemini-voice-style" hidden rows="4" style="display:none;"
+                                    aria-label="Phong cách đọc Gemini">Giọng nữ Việt Nam trẻ, âm sắc sáng và ấm, mềm mại, phát âm tròn và rõ chữ. Kể chuyện tự nhiên, gần gũi và cuốn hút; biểu cảm vừa phải, không kịch, không lên giọng quảng cáo. Giữ âm lượng và chất giọng ổn định.</textarea>
+                                <button type="button" id="btn-preview-gemini-voice" class="btn btn-sm" style="margin-top:8px;background:linear-gradient(135deg,#0ea5e9,#8b5cf6);color:#fff;border:none;padding:8px 18px;border-radius:8px;cursor:pointer;font-size:13px;display:inline-flex;align-items:center;gap:6px;">
+                                    <i class="fa-solid fa-headphones"></i> Nghe thử Ngọc Huyền
+                                </button>
+                                <span id="gemini-voice-preview-status" style="margin-left:8px;font-size:12px;color:#a78bfa;display:none;"></span>
+                                <audio id="gemini-voice-preview-audio" style="display:none;width:100%;margin-top:8px;height:36px;border-radius:8px;" controls></audio>
+                                <div style="margin-top:7px;font-size:12px;color:var(--text-muted,#94a3b8);">Chạy trên máy, không cần API. Model ViFastTts Ngọc Huyền dùng cho học tập, phi thương mại.</div>
                             </div>
                         </div>
 
@@ -792,6 +811,6 @@
     <div class="toast-container" id="toast-container"></div>
 
     <!-- Core Scripts -->
-    <script src="/static/js/main.js"></script>
+    <script src="/static/js/main.js?v=voice-controls-20261119"></script>
 </body>
 </html>

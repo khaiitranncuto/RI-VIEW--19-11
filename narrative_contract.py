@@ -146,9 +146,10 @@ def allocate_sentences(plan, target_count, target_words):
 
 
 def chapter_prompt(events, context):
+    from transition_contract import FIRST_SENTENCE_BRIDGE_RULE
     cards = [{k: e.get(k) for k in ('event_id', 'sentence_quota', 'tts_target_words',
               'observed_facts', 'allowed_character_names', 'scene_context', 'story_beat_summary',
-              'spoken_text', 'transcript_evidence', 'available_visual_seconds')}
+              'spoken_text', 'transcript_evidence', 'available_visual_seconds', 'transition_contract')}
              for e in events]
     for card in cards:
         card['observed_facts'] = [
@@ -158,7 +159,7 @@ def chapter_prompt(events, context):
         card['preferred_character_names'] = [c['name'] for c in context.get('characters') or []
             if c.get('name') and c['name'] in (card.get('allowed_character_names') or [])]
     return (
-        'VIET CHUONG RECAP THEO MACH TRUYEN, CHUA GHEP HINH. '
+        FIRST_SENTENCE_BRIDGE_RULE + 'VIET CHUONG RECAP THEO MACH TRUYEN, CHUA GHEP HINH. '
         'Doc tat ca tinh huong va mach truyen truoc khi viet. '
         'Moi event_id tra sentences la mang DUNG sentence_quota cau. Moi phan tu la dung mot cau '
         'ket thuc bang dau cham, hoi hoac than. Tong so cau BAT BUOC, khong dem so doan thay so cau. '

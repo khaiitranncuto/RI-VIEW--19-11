@@ -5,6 +5,7 @@ import unittest
 from evidence_writer import write_batch
 from flat_writer import flat_prompt, flat_to_paragraphs
 from tests import test_narration_units
+from narration_units import expand_writer_packet
 
 
 class CompactWriterTests(unittest.TestCase):
@@ -27,7 +28,7 @@ class CompactWriterTests(unittest.TestCase):
         event['sentence_slots'].append(dict(event['sentence_slots'][0], unit_id='E0001_U002'))
         event['sentence_quota'] = 2
         prompt = flat_prompt(events, {})
-        packet = json.loads(prompt.split('\n')[-1])
+        packet = expand_writer_packet(json.loads(prompt.split('\n')[-1]))
         for fact in event['observed_facts']:
             self.assertEqual(prompt.count(fact['text']), 1)
         self.assertEqual([u['unit_id'] for u in packet['events'][0]['units']],
@@ -41,7 +42,8 @@ class CompactWriterTests(unittest.TestCase):
         events = self.events()
         calls, splits, saved = [], [], []
         def generate(group, prompt):
-            calls.append(([e['event_id'] for e in group], json.loads(prompt.split('\n')[-1])))
+            calls.append(([e['event_id'] for e in group],
+                          expand_writer_packet(json.loads(prompt.split('\n')[-1]))))
             if len(group) > 1:
                 raise RuntimeError('503')
             return self.response(group)

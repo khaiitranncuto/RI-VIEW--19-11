@@ -70,6 +70,20 @@ class SourceWriterTests(unittest.TestCase):
         self.assertNotIn('"sentences":["Cau thu nhat."]', prompt)
         self.assertIn('"sentences":[{"text":', prompt)
 
+    def test_visual_fallback_preserves_sealed_proofs_even_when_audit_is_pending(self):
+        from grounded_pipeline import apply_local_visual_fallbacks
+        rows = bind_written_scenes(self.response(), [self.event()])
+        rows[0]['visual_sources'] = self.event()['visual_sources']
+        rows[0]['grounding_audit_passed'] = False
+        rows[0]['visual_alignment_errors'] = ['narration_audit_pending:cache_miss']
+        payload = {'parts': [{'scenes': rows}]}
+        result = apply_local_visual_fallbacks(payload)
+        self.assertEqual(result, payload)
+        self.assertTrue(is_source_grounded(result['parts'][0]['scenes'][0]))
+        rows[0]['tts'] += ' Changed.'
+        with self.assertRaisesRegex(ValueError, 'SOURCE_WRITER_LOCK_CHANGED'):
+            apply_local_visual_fallbacks(payload)
+
     def test_malformed_writer_shapes_raise_validation_errors(self):
         for payload in ('text', {'scenes': 'text'}, {'scenes': ['text']}):
             with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, 'SOURCE_WRITER_SCHEMA_INVALID'):

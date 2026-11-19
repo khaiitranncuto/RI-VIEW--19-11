@@ -55,6 +55,9 @@ _baseline*/
 
 # Local machine settings and scratch utilities
 app_settings.json
+local_tts/models/
+tts_diagnostics/
+SESSION_NOTES.md
 extract.py
 extract2.py
 test_edge.py

@@ -22,6 +22,10 @@ def observation_response_schema():
     character = {'type': 'object', 'properties': {
         **{k: string for k in ('id', 'canonical_id', 'name', 'alias', 'visual_signature')},
         **{k: strings for k in ('face_features', 'body_features', 'distinctive_features', 'appearance_variants')},
+        'identity_group': {'type': 'string', 'enum': ['main', 'supporting']},
+        'entity_kind': {'type': 'string', 'enum': ['person', 'animal', 'creature', 'unknown']},
+        'relationship_evidence': {'type': 'object', 'properties': {
+            'quote': string, 'description': string, 'shot_ids': strings}},
         'name_evidence': {'type': 'object', 'properties': {
             'kind': {'type': 'string', 'enum': ['dialogue', 'onscreen_text', 'unknown']},
             'quote': string, 'start_seconds': {'type': 'number'}, 'end_seconds': {'type': 'number'},
@@ -220,6 +224,10 @@ def observation_prompt(chunk, start, end, desired_facts, context=None):
         'Khong suy dien noi tam, loi thoai, bao boi hay ket qua tu tri nho phim. Transcript chi giup hieu ngu canh. '
         'Mot observation la mot menh de cu the, khong phai nhieu cach dien dat lai mot quyet dinh. '
         'Dung ten da xac nhan; chua chac dung biet danh ngan. '
+        'Phan loai identity_group=main|supporting, entity_kind=person|animal|creature|unknown. '
+        'Nhan vat phu va sinh vat chua ro ten dung mo ta ngoai hinh on dinh; khong bia ten rieng '
+        'hay loai. Quan he nhu "bo cua Kukuru" chi dung khi co relationship_evidence '
+        'gom quote hoac mo ta bang chung va shot_ids, khong suy doan tu tuoi/ngoai hinh. '
         'HO SO NHAN VAT trong CONTEXT la danh ba goc: KHONG doi ten/ID, KHONG dung lai ID '
         'cho nguoi khac. Doi chieu it nhat hai dac diem ben vung (mat, dang nguoi, mau long, '
         'dau hieu rieng); quan ao co the thay doi. Khong nhan dang chi dua vao vi tri hay vai tro. '
@@ -736,9 +744,17 @@ def audit_narrations(payload, audit, checkpoint=None, save=None, visual_evidence
     def emit(event, **data):
         if diagnostic:
             diagnostic(event, data)
+    boundary_contexts = {}
+    from narration_novelty import novelty_contexts, duplicate_sentences, novelty_signature
+    novelty = novelty_contexts(scenes)
+    duplicates = {r['scene_id']: r for r in duplicate_sentences(scenes)}
+    from transition_contract import narration_boundary, boundary_audit_signature
+    for index, scene in enumerate(scenes):
+        previous = scenes[index - 1] if index else None
+        boundary_contexts[scene['scene_id']] = narration_boundary(previous)
     for scene in scenes:
-        signature_data = [scene['tts'], scene.get('observed_facts'),
-                          scene.get('transition_contract')]
+        from identity_contract import audit_signature
+        visual_signature = None
         if visual_evidence:
             from recap_visual_media import evidence_manifest
             try:
@@ -748,9 +764,12 @@ def audit_narrations(payload, audit, checkpoint=None, save=None, visual_evidence
                         row[key] = round(row[key], 2)
             except (ValueError, TypeError, KeyError):
                 visual_signature = [visual_source_offset, scene.get('locked_visual_shots'), scene.get('visual_sources')]
-            signature_data += ['video_audit_v1', source_identity, visual_signature]
-        signature = hashlib.sha256(json.dumps(signature_data,
-                                   sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        signature = audit_signature(scene, source_identity, visual_signature)
+        # A boundary verdict depends on the preceding narration, including
+        # across verifier batches. Editing that narration invalidates the cache.
+        signature = boundary_audit_signature(signature, boundary_contexts[scene['scene_id']])
+        if scene.get('evidence_sentence_plan_version') or scene.get('narration_unit_version'):
+            signature = novelty_signature(signature, novelty[scene['scene_id']])
         scene['_audit_signature'] = signature
         if signature not in cache:
             pending.append(scene)
@@ -759,13 +778,22 @@ def audit_narrations(payload, audit, checkpoint=None, save=None, visual_evidence
          cache_only=max_attempts == 0, max_attempts=max_attempts, max_workers=max_workers)
     def inspect_batch(batch):
         cards = [{'scene_id': s['scene_id'], 'tts': s['tts'], 'observed_facts': s['observed_facts'],
+                  'previous_scene': boundary_contexts[s['scene_id']],
+                  'recent_narration': novelty[s['scene_id']],
+                  'identity_contract': copy.deepcopy(s.get('identity_contract') or {}),
+                  'allowed_character_names': copy.deepcopy(s.get('allowed_character_names') or []),
                   **({'transition_contract': copy.deepcopy(s['transition_contract'])}
                      if s.get('transition_contract') else {}),
                   **({'locked_visual_shots': copy.deepcopy(s.get('locked_visual_shots') or []),
                       'visual_sources': copy.deepcopy(s.get('visual_sources') or [])}
                      if visual_evidence else {})} for s in batch]
         try:
-            return batch, audit(cards)
+            emit('AUDIT_EVIDENCE_SENT', method='video' if visual_evidence else 'text',
+                 versions={s['scene_id']: s['_audit_signature'] for s in batch}, cards=cards)
+            response = audit(cards)
+            emit('AUDIT_VERIFIER_RESPONSE', method='video' if visual_evidence else 'text',
+                 expected_ids=[s['scene_id'] for s in batch], response=response)
+            return batch, response
         except (ValueError, TypeError) as exc:
             emit('AUDIT_CALLBACK_ERROR', expected_ids=[s['scene_id'] for s in batch],
                  error_type=type(exc).__name__, error=str(exc))
@@ -798,8 +826,15 @@ def audit_narrations(payload, audit, checkpoint=None, save=None, visual_evidence
         emit('AUDIT_PENDING_AFTER_ATTEMPT', attempt=attempt + 1,
              pending_ids=[s['scene_id'] for s in pending], will_retry=attempt + 1 < max_attempts)
     for scene in scenes:
+        from identity_contract import conflicting_verdict
         signature = scene.pop('_audit_signature')
         verdict = cache.get(signature)
+        if scene['scene_id'] in duplicates and (scene.get('evidence_sentence_plan_version') or scene.get('narration_unit_version')):
+            repeat = duplicates[scene['scene_id']]
+            verdict = dict(faithful=False, reason='duplicate_narration:'
+                + repeat['previous_scene_id'] + ':' + repeat['text'])
+        scene['audit_version'] = signature
+        scene['audit_verdict_conflict'] = not visual_evidence and conflicting_verdict(scene, verdict)
         scene['visual_alignment_errors'] = [error for error in scene.get('visual_alignment_errors') or []
                                             if not str(error).startswith(('unsupported_narration:', 'narration_audit_pending:'))]
         scene['grounding_audit_pending'] = verdict is None
@@ -809,6 +844,15 @@ def audit_narrations(payload, audit, checkpoint=None, save=None, visual_evidence
             scene.setdefault('visual_alignment_errors', []).append('unsupported_narration:' + verdict['reason'])
         scene['grounding_audit_passed'] = verdict is not None and verdict['faithful']
         scene['grounding_audit_method'] = 'video' if visual_evidence else 'text'
+        emit('AUDIT_SCENE_DECISION', scene_id=scene['scene_id'], signature=signature,
+             method=scene['grounding_audit_method'], tts=scene['tts'],
+             observed_facts=scene.get('observed_facts'), identity_contract=scene.get('identity_contract'),
+             verifier_verdict=verdict, backend_decision='pass' if scene['grounding_audit_passed'] else
+             'pending' if verdict is None else 'reject',
+             diagnostic_category='VERIFIER_FACT_CONFLICT' if scene['audit_verdict_conflict'] else
+             'MISSING_VERDICT' if verdict is None else 'ACCEPTED' if verdict['faithful'] else 'CONTENT_REJECTED',
+             video_review_required=scene['audit_verdict_conflict'],
+             locked_visual_shots=scene.get('locked_visual_shots'), source_offset=visual_source_offset)
         if scene['grounding_audit_passed']:
             scene.pop('visual_fallback', None)
             if visual_evidence:
@@ -847,12 +891,13 @@ def preserve_structure_only_narrations(previous, candidate, requirements):
     return result
 
 
-def preserve_verified_scenes(previous, candidate):
+def preserve_verified_scenes(previous, candidate, requested_scene_ids=None):
     """A failed repair must not replace an already verified narration/shot pair."""
     result = copy.deepcopy(candidate)
+    requested = set(requested_scene_ids or [])
     old = {s.get('scene_id'): s for p in previous.get('parts') or []
            for s in p.get('scenes') or [] if s.get('grounding_audit_passed')
-           and not s.get('visual_alignment_errors')}
+           and not s.get('visual_alignment_errors') and s.get('scene_id') not in requested}
     for part in result.get('parts') or []:
         part['scenes'] = [copy.deepcopy(old[s['scene_id']])
                           if s.get('scene_id') in old and
@@ -872,6 +917,13 @@ def apply_local_visual_fallbacks(payload, log=None):
     for part in result.get('parts') or []:
         scenes = part.get('scenes') or []
         for index, scene in enumerate(scenes):
+            if scene.get('source_grounded_writer_version'):
+                from source_grounded_writer import is_source_grounded
+                if not is_source_grounded(scene):
+                    raise ValueError('SOURCE_WRITER_LOCK_CHANGED: loi/hinh da doi sau khi chot')
+                # The writer already bound each claim to observed footage.
+                # A heuristic fallback must never replace that sealed proof.
+                continue
             errors = list(scene.get('visual_alignment_errors') or [])
             if not errors and scene.get('grounding_audit_passed') and scene.get('locked_visual_shots'):
                 continue

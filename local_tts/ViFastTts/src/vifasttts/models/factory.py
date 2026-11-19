@@ -1,0 +1,105 @@
+"""Factory model acoustic: chọn `arch` + warm-start tường minh v1 → v2 (docs/ACOUSTIC_V2.md §10–§11).
+
+- `arch` nằm trong **checkpoint** (`"v1_syl"` mặc định khi thiếu; `"v2_slot5"` cho v2);
+  factory đọc và dựng đúng lớp — **không** load chéo bằng `strict=False` ngầm.
+- `warm_start_v2_from_v1`: chỉ copy **subset key tường minh** (§11: embedding, encoder, decoder,
+  mel, postnet, tone_classifier, duration); module mới của v2 giữ khởi tạo riêng.
+"""
+
+from __future__ import annotations
+
+from torch import nn
+
+from vifasttts.models.v2_slot5 import ViFastTtsModelV2
+from vifasttts.models.vifasttts import ViFastTtsModel
+
+ARCH_V1 = "v1_syl"
+ARCH_V2 = "v2_slot5"
+ARCHES = (ARCH_V1, ARCH_V2)
+
+# Key được warm-start từ B0/v1 sang v2 (§11) — khớp theo tiền tố.
+WARM_START_PREFIXES = ("embedding.", "encoder.", "decoder.", "mel.", "postnet.",
+                       "tone_classifier.", "duration.")
+
+
+def arch_of_checkpoint(checkpoint: dict) -> str:
+    """`arch` trong checkpoint; thiếu → `v1_syl` (tương thích ngược toàn bộ checkpoint cũ)."""
+    return str(checkpoint.get("arch") or ARCH_V1)
+
+
+def build_model(config: dict, vocab_sizes: list[int], arch: str | None = None) -> nn.Module:
+    """Dựng model theo `arch` (ưu tiên tham số, rồi `config.model.arch`, mặc định `v1_syl`)."""
+    chosen = str(arch or config.get("model", {}).get("arch") or ARCH_V1)
+    if chosen == ARCH_V1:
+        return ViFastTtsModel(config, vocab_sizes)
+    if chosen == ARCH_V2:
+        return ViFastTtsModelV2(config, vocab_sizes)
+    raise ValueError(f"arch không hợp lệ: {chosen!r} (dùng {', '.join(ARCHES)})")
+
+
+#: Buffer mới thêm sau này được phép thiếu khi nạp checkpoint cũ (đều suy ra từ `f0_stats`).
+OPTIONAL_STATE_KEYS = frozenset({"tone_prior_z", "gate_bias.weight"})  # gate_bias: khởi tạo 0 (v18.29 Fc)
+
+
+def expand_legacy_onset_state(state: dict, target_rows: int, k_row: int) -> dict:
+    """Mở rộng embedding onset cũ (24) thêm hàng Q = K khi warm-start.
+
+    Đây là migration trọng số có chủ đích khi train; không phải adapter runtime.
+    """
+    result = dict(state)
+    key = "embedding.tables.0.weight"
+    weight = result.get(key)
+    if weight is None:
+        raise ValueError(f"Checkpoint thiếu {key} để mở rộng Q")
+    if tuple(weight.shape[:1]) == (target_rows,):
+        return result
+    if tuple(weight.shape[:1]) != (target_rows - 1,):
+        raise ValueError(f"{key} shape {tuple(weight.shape)} không khớp target {target_rows}")
+    expanded = weight.new_zeros((target_rows, *weight.shape[1:]))
+    expanded[: weight.shape[0]] = weight
+    expanded[-1] = weight[k_row]
+    result[key] = expanded
+    return result
+
+
+def load_model_state(model: nn.Module, state: dict) -> None:
+    """Nạp `state` (đã là state_dict của model) — chặt, chỉ tha buffer trong `OPTIONAL_STATE_KEYS`.
+
+    Dùng cho v2: checkpoint train trước T3.2 thiếu `tone_prior_z` (buffer suy từ `f0_stats`).
+    Mọi key khác thiếu/lạ → raise (giữ nguyên tắc "không load chéo ngầm" — §10).
+    """
+    incompatible = model.load_state_dict(state, strict=False)
+    missing = set(incompatible.missing_keys) - OPTIONAL_STATE_KEYS
+    if missing or incompatible.unexpected_keys:
+        raise ValueError(
+            f"Nạp checkpoint không khớp: thiếu {sorted(missing)}, "
+            f"lạ {sorted(incompatible.unexpected_keys)}"
+        )
+
+
+def warm_start_v2_from_v1(model_v2: nn.Module, checkpoint_v1: dict) -> dict[str, list[str]]:
+    """Copy trọng số v1 → v2 theo danh sách tường minh; trả `{"loaded", "skipped"}`.
+
+    Raise `ValueError` khi shape lệch (bắt lỗi cấu hình sớm thay vì mismatch im lặng).
+    """
+    source = checkpoint_v1.get("model", checkpoint_v1)
+    target = model_v2.state_dict()
+    subset: dict = {}
+    loaded: list[str] = []
+    skipped: list[str] = []
+    for key, value in source.items():
+        if not key.startswith(WARM_START_PREFIXES):
+            continue
+        if key not in target:
+            skipped.append(key)
+            continue
+        if key == "embedding.tables.0.weight" and tuple(value.shape) != tuple(target[key].shape):
+            # B0/v1 cũ 24 onset: thêm Q = K khi warm-start sang vocab 25.
+            value = expand_legacy_onset_state({key: value}, target[key].shape[0], 18)[key]
+        if tuple(target[key].shape) != tuple(value.shape):
+            raise ValueError(f"shape lệch cho {key}: checkpoint {tuple(value.shape)} "
+                             f"vs model {tuple(target[key].shape)}")
+        subset[key] = value
+        loaded.append(key)
+    model_v2.load_state_dict(subset, strict=False)
+    return {"loaded": sorted(loaded), "skipped": sorted(skipped)}

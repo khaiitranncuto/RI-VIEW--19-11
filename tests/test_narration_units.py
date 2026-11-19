@@ -2,7 +2,8 @@ import copy
 import json
 import unittest
 
-from narration_units import plan_narration_units, unit_response, validate_narration_unit_order
+from narration_units import (generate_unit_chunks, plan_narration_units, unit_prompt,
+    unit_response, validate_narration_unit_order)
 from evidence_writer import build_sentence_plan, bind_planned_scenes, write_batch
 from flat_writer import flat_prompt, flat_schema, flat_to_paragraphs
 from narrative_contract import verify_script, sentences
@@ -12,6 +13,27 @@ from source_grounded_writer import is_source_grounded
 
 
 class NarrationUnitTests(unittest.TestCase):
+    def test_structural_repair_preserves_good_units_and_exact_quota(self):
+        event = dict(event_id='E1', sentence_quota=3, sentence_slots=[
+            dict(unit_id='U1'), dict(unit_id='U2'), dict(unit_id='U3')])
+        previous = {'scenes': [dict(event_id='E1', narration_units=[
+            dict(unit_id='U1', text='First valid sentence.'),
+            dict(unit_id='U2', text='Two sentences. Invalid unit.'),
+            dict(unit_id='U3', text='Last valid sentence.')])]}
+        requested = []
+        def generate(events, prompt):
+            requested.extend(s['unit_id'] for s in events[0]['sentence_slots'])
+            return json.dumps({'sentences': [dict(event_id='E1', unit_id='U2',
+                text='Repaired sentence.')]})
+        raw = generate_unit_chunks(event, {}, generate, lambda *args: 'prompt',
+            previous, 'NARRATION_UNIT_ONE_SENTENCE_REQUIRED:E1')
+        rows = json.loads(raw)['sentences']
+        self.assertEqual(requested, ['U2'])
+        self.assertEqual([r['unit_id'] for r in rows], ['U1', 'U2', 'U3'])
+        self.assertTrue(all(len(sentences(r['text'])) == 1 for r in rows))
+        self.assertEqual(rows[0]['text'], 'First valid sentence.')
+        self.assertEqual(rows[2]['text'], 'Last valid sentence.')
+
     def plan(self):
         e = dict(event_id='E0001', scene_id='S0001', sentence_quota=1,
             start_seconds=0, end_seconds=12, grounded_plan_locked=True,
@@ -36,6 +58,41 @@ class NarrationUnitTests(unittest.TestCase):
         self.assertEqual(len(scene['sentence_proofs']), 1)
         self.assertEqual(len(scene['locked_visual_shots']), 2)
         self.assertTrue(is_source_grounded(scene))
+
+    def test_writer_prompt_keeps_full_metadata_while_compacting_instructions(self):
+        event = self.plan()['events_by_part'][0][0]
+        event['sentence_slots'][0]['transition_contract'] = {
+            'version': 1, 'relation': 'location_change', 'requires_bridge': True,
+            'previous_event_id': 'E0000', 'current_event_id': 'E0001',
+            'previous_anchor': 'Cáº£nh trÆ°á»›c.', 'current_anchor': 'Cáº£nh hiá»‡n táº¡i.',
+            'previous_location': 'NhÃ ', 'current_location': 'Rá»«ng',
+            'semantic_goal': 'introduce_the_confirmed_new_location',
+            'forbidden_inferences': ['unverified_causality'],
+            'evidence_basis': ['planner_temporal_relation'],
+            'variation_key': 'location_change:E0001',
+            'wording_policy': 'free_semantic_paraphrase',
+        }
+        prompt = unit_prompt([event], {})
+        self.assertIn('location_change', prompt)
+        self.assertIn('introduce_the_confirmed_new_location', prompt)
+        self.assertIn('unverified_causality', prompt)
+        self.assertIn('source_start', prompt)
+        self.assertIn('previous_event_id', prompt)
+        self.assertIn('evidence_basis', prompt)
+        self.assertIn('variation_key', prompt)
+
+    def test_single_unit_prompt_can_exceed_batching_soft_limit(self):
+        event = self.plan()['events_by_part'][0][0]
+        prompts = []
+        def oversized_prompt(*_):
+            return 'x' * 16000
+        def generate(events, prompt):
+            prompts.append(prompt)
+            return json.dumps(self.response())
+        result = json.loads(generate_unit_chunks(
+            event, {}, generate, oversized_prompt))
+        self.assertEqual(result, self.response())
+        self.assertEqual([len(prompt) for prompt in prompts], [16000])
 
     def test_unit_ids_survive_normalization_merge_and_export(self):
         e = self.plan()['events_by_part'][0][0]

@@ -153,6 +153,52 @@ def unit_schema(events):
         'required': ['event_id', 'unit_id', 'text']}}}, 'required': ['sentences']}
 
 
+def compact_writer_packet(packet):
+    """Losslessly encode repeated values and field names for the text writer."""
+    from collections import Counter
+    counts = Counter()
+    keys = Counter()
+    def count(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                keys[key] += 1
+                count(child)
+        elif isinstance(value, list):
+            for child in value:
+                count(child)
+        elif isinstance(value, str):
+            counts[value] += 1
+    count(packet)
+    aliases = {key: f'k{i}' for i, (key, n) in enumerate(keys.items())
+               if n > 2 and len(key) > 8}
+    repeated = [value for value, n in counts.items() if n > 1 and len(value) >= 40]
+    refs = {value: i for i, value in enumerate(repeated)}
+    def encode(value):
+        if isinstance(value, dict):
+            return {aliases.get(key, key): encode(child) for key, child in value.items()}
+        if isinstance(value, list):
+            return [encode(child) for child in value]
+        if isinstance(value, str) and value in refs:
+            return {'$': refs[value]}
+        return value
+    return {'key_names': {alias: key for key, alias in aliases.items()},
+            'shared_text': repeated, 'data': encode(packet)}
+
+
+def expand_writer_packet(compact):
+    """Decode the transport representation for verification and diagnostics."""
+    names, texts = compact['key_names'], compact['shared_text']
+    def expand(value):
+        if isinstance(value, dict):
+            if set(value) == {'$'} and isinstance(value['$'], int):
+                return texts[value['$']]
+            return {names.get(key, key): expand(child) for key, child in value.items()}
+        if isinstance(value, list):
+            return [expand(child) for child in value]
+        return value
+    return expand(compact['data'])
+
+
 def unit_prompt(events, context, previous=None, error=None):
     from evidence_writer import VIETNAMESE_WRITER_RULE, paragraph_card
     from character_identity import render_identity_context
@@ -162,6 +208,7 @@ def unit_prompt(events, context, previous=None, error=None):
         card = paragraph_card(event)
         cards.append(dict(event_id=event['event_id'],
             role=card['narrative_role'], allowed_names=card['allowed_names'],
+            identity_contract=card['identity_contract'],
             scene_context=card['scene_context'],
             facts=[dict(f, text=render_identity_context(f['text'], people)) for f in card['facts']],
             units=[dict(unit_id=u['unit_id'], fact_ids=u['fact_ids'],
@@ -176,7 +223,7 @@ def unit_prompt(events, context, previous=None, error=None):
         story=[render_identity_context(str(s)[:600], people)
                for s in context.get('all_part_summaries') or []],
         before=[str(s.get('tts') or '')[-600:]
-                for s in (context.get('previous_part_tail') or [])[-2:]],
+                for s in (context.get('previous_part_tail') or [])[-3:]],
         after=[render_identity_context(str(s.get('event') or '')[:600], people)
                for s in (context.get('next_batch_context') or [])[:2]], events=cards)
     if error:
@@ -186,34 +233,153 @@ def unit_prompt(events, context, previous=None, error=None):
                          for u in r['narration_units']]} if r.get('narration_units') else
                {'text': r.get('paragraph') or r.get('tts') or ''}))
             for r in (previous or {}).get('scenes') or [] if r.get('event_id') in wanted])
-    return (VIETNAMESE_WRITER_RULE +
-        'DON VI LOI KE CO ID; MOI ID BAT BUOC DUNG MOT CAU NGU PHAP. '
-        'Đọc toàn cụm, viết thành mạch recap liền nhau rồi trả từng unit theo thứ tự. '
-        'Mỗi unit_id có đúng một text, text đó phải là ĐÚNG MỘT câu ngữ pháp kết thúc bằng dấu câu; '
-        'một câu có thể gồm nhiều mệnh đề và dùng một hoặc nhiều shot đã khóa. '
-        'Viết gần đúng target_words của unit để toàn bài đạt thời lượng; không rút thành câu cụt. '
-        'Chỉ kể chi tiết trong facts được giao cho unit; nhiều unit dùng cùng fact '
-        'phải kể các chi tiết khác nhau có thật, không lặp ý để đủ số lượng. '
-        'Giữ đúng nhân vật, hành động và trình tự source_order; không tự thêm '
-        'kết quả, nội tâm, quan hệ nhân quả hay suy đoán. scene_context, story và '
-        'transcript chỉ giúp hiểu mạch, không chứng minh hành động đang thấy. '
-        'Chỉ dùng lời người kể, không trích thoại hay sao chép Whisper; chỉ kể '
-        'gián tiếp ý nghĩa lời nói khi fact dialogue có nội dung rõ ràng. '
-        'Nối đoạn với before/after tự nhiên, không viết lại chúng; giữ tên nhất quán. '
-        'transition_contract khóa QUAN HỆ NGỮ NGHĨA ở ranh giới sự kiện, không khóa câu chữ. '
-        'Hãy diễn đạt tự nhiên và đa dạng theo ngữ cảnh (có thể dùng cấu trúc như sau một hành động, '
-        'khi một việc kết thúc, chuẩn bị cho hành động, phát hiện rồi phản ứng, vượt trở ngại, '
-        'hoặc giới thiệu lại chủ thể). Theo dõi các câu ngay trước để tránh lặp cùng một từ nối; '
-        'nhưng tuyệt đối không thêm quan hệ thời gian, '
-        'nhân quả, song song hay quay lại ngoài relation và các anchor đã cho. '
-        'Với neutral_reintroduction, chỉ giới thiệu lại chủ thể/địa điểm hiện tại đã xác nhận; '
-        'không dùng từ ngụ ý trước-sau hoặc nguyên nhân-kết quả. continuation không bắt buộc có từ nối. '
-        'Phần ending kể ngắn gọn kết quả được chứng minh, không thêm tổng kết. '
-        'Trả đúng ID theo units, không thêm bớt. Backend kiểm số lượng và gắn hình. '
+    from transition_contract import FIRST_SENTENCE_BRIDGE_RULE
+    return (VIETNAMESE_WRITER_RULE + FIRST_SENTENCE_BRIDGE_RULE +
+        'VIẾT THEO CỤM TÌNH HUỐNG: đọc story, before và toàn bộ events trước; lập mạch kể cả cụm, '
+        'viết như một đoạn liên tục rồi xuất từng câu vào đúng unit_id. ID chỉ để gắn hình, không phải yêu cầu viết câu độc lập. '
+        'Giữ nguyên fact, thứ tự, số câu và hình của từng unit; không chuyển chi tiết sang unit khác để làm mượt. '
+        'Trong cùng tình huống, kế thừa chủ thể từ câu trước: dùng đại từ hoặc lược chủ ngữ khi rõ nghĩa, '
+        'tránh mở liên tiếp bằng cùng tên; khi đổi người hoặc có thể nhầm thì gọi tên lại. '
+        'Trước câu đầu mỗi tình huống, đọc transition_contract để biết việc trước đã hoàn thành chưa, '
+        'việc mới ở đâu/lúc nào, nối tiếp, chuẩn bị, nhân quả hay đồng thời. requires_bridge=true thì '
+        'câu đầu phải thể hiện quan hệ được xác nhận hoặc giới thiệu bối cảnh mới; đưa cầu nối vào câu có sẵn, không thêm unit. '
+        'Không suy ra thời gian truyện chỉ từ thứ tự cảnh. “Sau khi…xong” cần bằng chứng hoàn thành; '
+        '“trong lúc ấy” cần bằng chứng đồng thời; “để chuẩn bị” cần mục đích đã xác nhận; '
+        '“vì vậy/như vậy” cần nhân quả hoặc kết luận có căn cứ. Không cấm “sau đó”, “và” hay bất kỳ từ nối nào '
+        'nhưng không chèn máy móc; quan hệ chưa rõ thì giới thiệu nơi/chủ thể hiện tại. '
+        'Đọc lại cả cụm: sửa lặp chủ ngữ, đại từ mơ hồ, lặp ý và nhảy bối cảnh; vẫn giữ nguyên từng ID và bằng chứng. '
+        'Chỉ nối khi đổi diễn biến/thời gian/tuyến kể; ranh giới ID hoặc cụm kỹ thuật không buộc thêm từ nối. '
+        'Hiểu cả hoạt động trước, không chỉ chi tiết cuối: khi nguồn xác nhận đã bắt cá xong, '
+        'dùng cách khép hoạt động như “Sau khi bắt cá xong…” nếu phù hợp; không kể thành “Đang bắt cá…”. '
+        'Mỗi câu phải bổ sung thông tin khác. Không nhắc lại trạng thái/cảm xúc bằng từ khác để đủ số câu. '
+        'MOI ID BAT BUOC DUNG MOT CAU NGU PHAP, hoàn chỉnh, kết thúc bằng dấu câu, đúng thứ tự. '
+        'Câu có thể gồm nhiều mệnh đề và shot đã khóa; bám target_words, không viết câu cụt. '
+        'Chỉ dùng facts của unit; nếu nhiều unit chung fact, kể các chi tiết có thật khác nhau, không lặp ý. '
+        'Giữ nhân vật, hành động, source_order; không bịa kết quả, nội tâm, nhân quả hoặc suy đoán. '
+        'identity_contract tách người có mặt với người chỉ được nhắc đến; tên được nhắc trong lời thoại '
+        'không chứng minh người đó xuất hiện hay hành động trong hình. Không nhầm "gian khổ" với tên Gian. '
+        'Nhân vật phụ/sinh vật dùng tên hoặc mô tả đã khóa; không tự đặt tên riêng, '
+        'quan hệ như bố của ai, hay loài sinh vật khi nguồn chưa xác nhận. '
+        'scene_context/story/transcript chỉ là ngữ cảnh, không chứng minh hình ảnh; '
+        'chỉ kể gián tiếp nội dung fact dialogue xác nhận. '
+        'Nối before/after tự nhiên, không kể lại; tên nhất quán, tránh lặp từ nối. '
+        'transition_contract khóa quan hệ ngữ nghĩa, không khóa câu chữ: diễn đạt đa dạng nhưng không thêm quan hệ ngoài relation và anchors. '
+        'neutral_reintroduction chỉ giới thiệu lại chủ thể/địa điểm đã xác nhận, không ám chỉ trước-sau hay nhân-quả; continuation không bắt buộc có từ nối. '
+        'Ending chỉ nêu ngắn kết quả có bằng chứng, không tổng kết. Trả đủ ID/unit. '
         'Chỉ trả JSON {"sentences":[{"event_id":"E0001","unit_id":"E0001_U001",'
         '"text":"Lời kể."}]}.\n'
-        + json.dumps(packet, ensure_ascii=False, separators=(',', ':')))
+        + 'Giải mã data trước khi viết: key_names đổi khóa ngắn thành tên đầy đủ; '
+          '{"$":n} thay bằng toàn bộ shared_text[n] (từ 0), giữ đủ nghĩa tại mỗi lần tham chiếu. '
+          'Đầu ra dùng schema trên.\n'
+        + json.dumps(compact_writer_packet(packet), ensure_ascii=False, separators=(',', ':')))
 
+
+
+def generate_unit_chunks(event, context, generate, prompt_builder, previous=None, error=None,
+                         save_raw=None):
+    """Keep original unit IDs and bind only after the entire event is assembled."""
+    from recap_visual_media import parse_writing_response
+    from narrative_contract import sentences
+    remaining = list(event['sentence_slots'])
+    completed = []
+    # Reuse only structurally valid, unambiguous units from this event. Semantic
+    # audit failures still require a fresh draft of the affected event.
+    reusable = {}
+    structural_error = str(error or '').startswith(('NARRATION_UNIT_IDS_INVALID',
+        'NARRATION_UNIT_ONE_SENTENCE_REQUIRED', 'PARAGRAPH_REPEATED_SENTENCE'))
+    if structural_error:
+        prior = [u for row in (previous or {}).get('scenes', [])
+                 if row.get('event_id') == event['event_id']
+                 for u in row.get('narration_units', [])]
+        seen_texts = set()
+        for slot in remaining:
+            matches = [u for u in prior if u.get('unit_id') == slot['unit_id']]
+            if not matches or any(u != matches[0] for u in matches):
+                continue
+            unit = matches[0]
+            text = unit.get('text')
+            if not isinstance(text, str) or len(sentences(text)) != 1:
+                continue
+            normalized = ' '.join(text.casefold().split())
+            if normalized in seen_texts:
+                continue
+            seen_texts.add(normalized)
+            reusable[slot['unit_id']] = dict(unit, event_id=event['event_id'])
+    while remaining:
+        if remaining[0]['unit_id'] in reusable:
+            completed.append(reusable[remaining.pop(0)['unit_id']])
+            continue
+        chunk_context = copy.deepcopy(context)
+        if completed:
+            chunk_context['previous_part_tail'] = (list(context.get('previous_part_tail') or [])
+                + [{'tts': ' '.join(u['text'] for u in completed[-3:])}])[-3:]
+        selected = []
+        for slot in remaining:
+            if slot['unit_id'] in reusable:
+                break
+            candidate = selected + [slot]
+            partial = dict(event, sentence_slots=candidate, sentence_quota=len(candidate))
+            prompt = prompt_builder([partial], chunk_context, previous, error)
+            if selected and len(prompt) > 14000:
+                # Finish this planned sentence only when the overrun is small
+                # and at least half its incremental input still fits.
+                old = dict(event, sentence_slots=selected, sentence_quota=len(selected))
+                old_size = len(prompt_builder([old], chunk_context, previous, error))
+                increment = len(prompt) - old_size
+                if len(prompt) <= 15500 and 14000 - old_size >= increment / 2:
+                    selected = candidate
+                break
+            selected = candidate
+        partial = dict(event, sentence_slots=selected, sentence_quota=len(selected))
+        prompt = prompt_builder([partial], chunk_context, previous, error)
+        # At this point the event has already been reduced to the smallest safe
+        # writing request: one or more complete narration units.  Never discard
+        # evidence or stop merely because a single complete unit needs a prompt
+        # larger than the batching soft limit; let the model/backend enforce its
+        # actual request capacity.
+        raw = generate([partial], prompt)
+        if save_raw:
+            save_raw(raw, [partial])
+        payload = parse_writing_response(raw)
+        rows = payload.get('sentences') or []
+        # Preserve only unambiguous IDs; never attach text by array position.
+        valid = {}
+        for slot in selected:
+            matches = [r for r in rows if isinstance(r, dict)
+                       and r.get('unit_id') == slot['unit_id']
+                       and r.get('event_id') == event['event_id']
+                       and isinstance(r.get('text'), str) and r['text'].strip()]
+            if (matches and all(r == matches[0] for r in matches)
+                    and len(sentences(matches[0]['text'])) == 1):
+                valid[slot['unit_id']] = matches[0]
+        for slot in selected:
+            if slot['unit_id'] in valid:
+                continue
+            single = dict(event, sentence_slots=[slot], sentence_quota=1)
+            for attempt in range(2):
+                repair = 'NARRATION_UNIT_IDS_INVALID: expected event_id=' + event['event_id'] + '; unit_id=' + slot['unit_id']
+                raw = generate([single], prompt_builder([single], chunk_context, previous, repair))
+                if save_raw:
+                    save_raw(raw, [single])
+                try:
+                    repaired = parse_writing_response(raw).get('sentences') or []
+                except ValueError:
+                    continue
+                if (len(repaired) == 1 and isinstance(repaired[0], dict)
+                        and repaired[0].get('event_id') == event['event_id']
+                        and repaired[0].get('unit_id') == slot['unit_id']
+                        and isinstance(repaired[0].get('text'), str)
+                        and repaired[0]['text'].strip()
+                        and len(sentences(repaired[0]['text'])) == 1):
+                    valid[slot['unit_id']] = repaired[0]
+                    break
+        missing = [s['unit_id'] for s in selected if s['unit_id'] not in valid]
+        if missing:
+            raise ValueError('NARRATION_UNIT_IDS_INVALID:' + event['event_id'] + '; missing=' + str(missing))
+        rows = [valid[s['unit_id']] for s in selected]
+        completed.extend(rows)
+        remaining = remaining[len(selected):]
+    return json.dumps({'sentences': completed}, ensure_ascii=False)
 
 
 def unit_response(payload, events):

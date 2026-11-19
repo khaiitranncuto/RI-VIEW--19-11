@@ -508,6 +508,33 @@ async def generate_tts_chunk_with_timing(
     
     # Khong dung the BREAK nua — chi truyen van ban thuan tuy
     audio_text = text
+    if voice == 'local:ngochuyen':
+        from datetime import timedelta
+        from edge_tts.submaker import Subtitle
+        root = os.path.dirname(os.path.abspath(__file__))
+        wav_path = output_path + '.wav'
+        await asyncio.to_thread(subprocess.run, [
+            os.path.join(root, 'local_tts', 'venv', 'Scripts', 'python.exe'),
+            os.path.join(root, 'local_voice_worker.py'), text, wav_path,
+            str(1 + int(str(rate).rstrip('%')) / 100)
+        ], check=True, capture_output=True, timeout=180,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        await asyncio.to_thread(subprocess.run, [get_ffmpeg_exe(), '-y', '-i', wav_path,
+            '-ar', '24000', '-ac', '1', output_path], check=True, capture_output=True,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        with open(wav_path + '.json', encoding='utf-8') as f:
+            units = json.load(f)
+        warning_path = wav_path + '.warnings.json'
+        if os.path.exists(warning_path) and log_fn:
+            with open(warning_path, encoding='utf-8') as f:
+                for name in json.load(f):
+                    log_fn('WARNING', f'Ngoc Huyen: "{name}" dung phien am tu dong chua nghe duyet; co the sua pronunciation_overrides.json.')
+        submaker = SubMaker()
+        for unit in units:
+            submaker.cues.append(Subtitle(index=None,
+                start=timedelta(milliseconds=unit['start_ms']),
+                end=timedelta(milliseconds=unit['end_ms']), content=unit['text']))
+        return submaker
     
     retry_count = max(1, int(max_retries or MAX_TTS_RETRIES))
     for attempt in range(retry_count):
@@ -771,6 +798,9 @@ def _compact_group_pauses(raw_path, submaker, texts, content_end, ffmpeg_exe):
 
 
 def _tts_cache_paths(text, voice, rate):
+    if voice == 'local:ngochuyen':
+        from local_pronunciation import cache_version
+        voice = voice + ':' + cache_version()
     identity = f"v3-WordBoundary\0{voice}\0{rate}\0{text}".encode("utf-8", errors="replace")
     cache_key = hashlib.sha256(identity).hexdigest()
     return (
@@ -1364,6 +1394,16 @@ def generate_all_tts(
     print(f"[INFO] Hoan thanh tai TTS da luong.")
     
     # 3. Sap xep ket qua va tinh toan time tich luy (Cumulative time)
+    from voice_audio import apply_voice_settings
+    processed_paths = set()
+    for _, item_results, group_path in group_results:
+        paths = [item[2] for item in item_results if item[1] == 'TTS']
+        if group_path:
+            paths.append(group_path)
+        for path in paths:
+            if path not in processed_paths:
+                apply_voice_settings(path, options.get('voice_settings'), ffmpeg_exe)
+                processed_paths.add(path)
     group_results.sort(key=lambda x: x[0])
     results = []
     continuous_group_paths = []

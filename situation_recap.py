@@ -82,7 +82,9 @@ def bind_character_registry(payload, registry, identity_shot_ids=None, transcrip
         {sid for e in result.get('events') or [] for f in e.get('grounded_facts') or []
          for sid in f.get('shot_ids') or []})
     next_id = max([int(k[1:]) for k in known] or [0]) + 1
-    local_labels, local_canonical, legacy_names = {}, {}, {}
+    local_labels = {cid: c.get('display_name') or c.get('name') or c.get('neutral_alias')
+                    for cid, c in known.items()}
+    local_canonical, legacy_names = {}, {}
     def feature_score(character, features):
         stable = clean_list(character.get('stable_features'))
         references = stable + clean_list(character.get('face_features')) + clean_list(character.get('body_features'))
@@ -98,8 +100,6 @@ def bind_character_registry(payload, registry, identity_shot_ids=None, transcrip
         stable_hit = any(_label(r) in matched_refs for r in stable)
         return len(matched_refs) if len(matched_refs) >= 2 and (stable_hit or not stable) else 0
     for c in result.get('characters') or []:
-        if any(r.get('name_source') == 'gemini' for r in known.values()):
-            c['name_source'] = 'gemini'
         local_id = str(c.get('id') or '').upper()
         proposed = str(c.get('name') or '').strip()
         evidence = c.get('identity_evidence') or {}
@@ -118,6 +118,8 @@ def bind_character_registry(payload, registry, identity_shot_ids=None, transcrip
         named = [key for key, r in known.items() if proposed and _label(proposed) in
             {_label(n) for n in [r.get('name', ''), r.get('proposed_name', '')]
                 + list(r.get('aliases') or []) + list(r.get('name_alias_candidates') or []) if n}]
+        if len(named) == 1 and known[named[0]].get('name_source') == 'gemini':
+            c['name_source'] = 'gemini'
         # Clip-local P IDs can collide with IDs allocated in earlier clips.
         if len(named) == 1:
             cid = named[0]
@@ -188,6 +190,9 @@ def bind_character_registry(payload, registry, identity_shot_ids=None, transcrip
         c['alias'] = target['neutral_alias']
         c['display_name'] = (c['name'] if accepted or (conflict and gemini_name) else '') or c['neutral_alias']
         c['name_evidence'] = copy.deepcopy(target.get('name_evidence') or c.get('name_evidence'))
+        for field in ('identity_group', 'entity_kind', 'naming_basis', 'relationship_evidence'):
+            if field in target:
+                c[field] = copy.deepcopy(target[field])
         for field in ('stable_features', 'face_features', 'body_features', 'distinctive_features',
                       'appearance_variants', 'reference_shot_ids', 'appearances',
                       'verified_reference_seconds', 'reference_frames', 'name_candidates'):

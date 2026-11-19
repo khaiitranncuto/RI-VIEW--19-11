@@ -7,6 +7,36 @@ from transition_contract import apply_transition_contracts
 
 
 class TransitionContractTests(unittest.TestCase):
+    def test_boundary_verifier_receives_previous_scene_across_parts(self):
+        first = dict(scene_id='S1', tts='Kukuru bắt được cá.',
+                     observed_facts=[{'text': 'Kukuru bắt cá.'}], grounded_plan_locked=True)
+        second = dict(scene_id='S2', tts='Tại khu rừng, Kukuru thấy khói.',
+                      observed_facts=[{'text': 'Kukuru thấy khói.'}], grounded_plan_locked=True)
+        seen, cache = [], {}
+
+        def audit(cards):
+            seen.extend(copy.deepcopy(cards))
+            return {'checks': [{'scene_id': c['scene_id'], 'faithful': True, 'reason': ''}
+                               for c in cards]}
+
+        payload = {'parts': [{'scenes': [first]}, {'scenes': [second]}]}
+        audit_narrations(payload, audit, save=lambda value: cache.update(value))
+        self.assertEqual(seen[1]['previous_scene']['tts'], first['tts'])
+        seen.clear()
+        payload['parts'][0]['scenes'][0]['tts'] = 'Kukuru lên bờ với con cá.'
+        audit_narrations(payload, audit, checkpoint=cache)
+        self.assertEqual([c['scene_id'] for c in seen], ['S1', 'S2'])
+
+    def test_boundary_contract_preserves_source_actors_and_end_facts(self):
+        _, current = self.contracts(
+            self.event('E1', characters=['P2'], observed_facts=[
+                {'fact_id': 'F1', 'text': 'Doraemon bị đánh bại.', 'canonical_actor_ids': ['P2']}]),
+            self.event('E2', characters=['P1'], observed_facts=[
+                {'fact_id': 'F2', 'text': 'Nobita tỉnh dậy giữa tuyết.'}]))
+        contract = current['transition_contract']
+        self.assertEqual(contract['previous_end_state']['facts'][0]['actor_ids'], ['P2'])
+        self.assertEqual(contract['current_start_state']['facts'][0]['fact_id'], 'F2')
+
     def event(self, event_id, **updates):
         row = dict(event_id=event_id, event='Một sự kiện được quan sát.',
                    sentence_slots=[{'unit_id': event_id + '_U001'}],
